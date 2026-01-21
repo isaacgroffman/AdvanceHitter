@@ -387,7 +387,7 @@ calculate_grade_metrics <- function(tm_data) {
     summarise(
       n_pa = sum(is_pa, na.rm = TRUE),
       sdrv = 100 * mean(mean_DRE_bat, na.rm = TRUE),
-      xba = mean(xBA[PitchCall == "InPlay"], na.rm = TRUE),
+      woba_avg = mean(woba, na.rm = TRUE),
       iso = (sum(totalbases, na.rm = TRUE) / pmax(1, sum(is_ab, na.rm = TRUE))) - 
             (sum(is_hit, na.rm = TRUE) / pmax(1, sum(is_ab, na.rm = TRUE))),
       xpf = sum(totalbases[PitchCall == "InPlay"], na.rm = TRUE) /
@@ -404,8 +404,8 @@ calculate_grade_metrics <- function(tm_data) {
   list(
     sdrv_mean = mean(batter_stats$sdrv, na.rm = TRUE),
     sdrv_sd = sd(batter_stats$sdrv, na.rm = TRUE),
-    xba_mean = mean(batter_stats$xba, na.rm = TRUE),
-    xba_sd = sd(batter_stats$xba, na.rm = TRUE),
+    woba_mean = mean(batter_stats$woba_avg, na.rm = TRUE),
+    woba_sd = sd(batter_stats$woba_avg, na.rm = TRUE),
     iso_mean = mean(batter_stats$iso, na.rm = TRUE),
     iso_sd = sd(batter_stats$iso, na.rm = TRUE),
     xpf_mean = mean(batter_stats$xpf, na.rm = TRUE),
@@ -445,7 +445,7 @@ calculate_hitter_profile <- function(hitter_name, tm_data, grade_metrics, pitche
   
   # Calculate stats
   sdrv <- 100 * mean(h_data$mean_DRE_bat, na.rm = TRUE)
-  xba <- mean(h_data$xBA[h_data$PitchCall == "InPlay"], na.rm = TRUE)
+  # woba already calculated above, used for contact grade
   iso <- (sum(h_data$totalbases, na.rm = TRUE) / pmax(1, n_ab)) - 
          (sum(h_data$is_hit, na.rm = TRUE) / pmax(1, n_ab))
   xpf <- sum(h_data$totalbases[h_data$PitchCall == "InPlay"], na.rm = TRUE) /
@@ -527,9 +527,9 @@ calculate_hitter_profile <- function(hitter_name, tm_data, grade_metrics, pitche
   } else 0
   avoid_k_grade <- zscore_to_grade(avoid_k_z)
   
-  # Contact: higher zone_con is better, higher xba is better
-  contact_z <- if(!is.na(zone_con) && !is.na(xba) && !is.na(gm$zone_con_sd) && !is.na(gm$xba_sd) && gm$zone_con_sd > 0 && gm$xba_sd > 0) {
-    ((zone_con - gm$zone_con_mean) / gm$zone_con_sd + (xba - gm$xba_mean) / gm$xba_sd) / 2
+  # Contact: higher zone_con is better, higher wOBA is better
+  contact_z <- if(!is.na(zone_con) && !is.na(woba) && !is.na(gm$zone_con_sd) && !is.na(gm$woba_sd) && gm$zone_con_sd > 0 && gm$woba_sd > 0) {
+    ((zone_con - gm$zone_con_mean) / gm$zone_con_sd + (woba - gm$woba_mean) / gm$woba_sd) / 2
   } else 0
   contact_grade <- zscore_to_grade(contact_z)
   
