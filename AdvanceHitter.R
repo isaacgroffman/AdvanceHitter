@@ -175,6 +175,17 @@ add_indicators <- function(df) {
 }
 
 tm_data <- add_indicators(tm_data)
+
+# Ensure all required columns exist in tm_data with proper defaults
+# This fixes the ifelse() bug where scalar conditions return only the first element
+if (!"mean_DRE_bat" %in% names(tm_data)) tm_data$mean_DRE_bat <- 0
+if (!"RelSpeed" %in% names(tm_data)) tm_data$RelSpeed <- 85
+if (!"InducedVertBreak" %in% names(tm_data)) tm_data$InducedVertBreak <- 12
+if (!"HorzBreak" %in% names(tm_data)) tm_data$HorzBreak <- 0
+if (!"SpinRate" %in% names(tm_data)) tm_data$SpinRate <- 2200
+if (!"RelHeight" %in% names(tm_data)) tm_data$RelHeight <- 6
+if (!"RelSide" %in% names(tm_data)) tm_data$RelSide <- 0
+
 all_hitters <- sort(unique(tm_data$Batter))
 
 # Create SEC pool for percentile comparisons
@@ -189,18 +200,19 @@ d1_pool_data <- tm_data
 # ============================================================================
 
 # Create pitcher arsenal summary
+# Note: Direct column references used instead of ifelse() to avoid scalar condition bug
 pitcher_arsenal <- tm_data %>%
   filter(!is.na(TaggedPitchType)) %>%
   mutate(PitchFamily = classify_pitch_family(TaggedPitchType)) %>%
   group_by(Pitcher, PitcherThrows, PitchFamily) %>%
   summarise(
     n = n(),
-    RelSpeed = mean(ifelse("RelSpeed" %in% names(tm_data), RelSpeed, 85), na.rm = TRUE),
-    InducedVertBreak = mean(ifelse("InducedVertBreak" %in% names(tm_data), InducedVertBreak, 12), na.rm = TRUE),
-    HorzBreak = mean(ifelse("HorzBreak" %in% names(tm_data), HorzBreak, 0), na.rm = TRUE),
-    SpinRate = mean(ifelse("SpinRate" %in% names(tm_data), SpinRate, 2200), na.rm = TRUE),
-    RelHeight = mean(ifelse("RelHeight" %in% names(tm_data), RelHeight, 6), na.rm = TRUE),
-    RelSide = mean(ifelse("RelSide" %in% names(tm_data), RelSide, 0), na.rm = TRUE),
+    RelSpeed = mean(RelSpeed, na.rm = TRUE),
+    InducedVertBreak = mean(InducedVertBreak, na.rm = TRUE),
+    HorzBreak = mean(HorzBreak, na.rm = TRUE),
+    SpinRate = mean(SpinRate, na.rm = TRUE),
+    RelHeight = mean(RelHeight, na.rm = TRUE),
+    RelSide = mean(RelSide, na.rm = TRUE),
     .groups = "drop"
   ) %>%
   filter(n >= 10) %>%
@@ -231,24 +243,25 @@ feature_sds <- list(
 feature_sds <- lapply(feature_sds, function(x) if(is.na(x) || x == 0) 1 else x)
 
 # Create batter pitch performance data with standardized features
+# Note: Direct column references used instead of ifelse() to avoid scalar condition bug
 batter_pitch_performance <- tm_data %>%
   filter(!is.na(TaggedPitchType)) %>%
   mutate(
     PitchFamily = classify_pitch_family(TaggedPitchType),
-    hitter_rv = ifelse("mean_DRE_bat" %in% names(tm_data), mean_DRE_bat, 0),
-    # Standardize features - use default values if columns don't exist
-    RelSpeed_z = (ifelse("RelSpeed" %in% names(tm_data), RelSpeed, 85) - feature_means$RelSpeed) / feature_sds$RelSpeed,
-    IVB_z = (ifelse("InducedVertBreak" %in% names(tm_data), InducedVertBreak, 12) - feature_means$InducedVertBreak) / feature_sds$InducedVertBreak,
-    HB_z = (ifelse("HorzBreak" %in% names(tm_data), HorzBreak, 0) - feature_means$HorzBreak) / feature_sds$HorzBreak,
-    SpinRate_z = (ifelse("SpinRate" %in% names(tm_data), SpinRate, 2200) - feature_means$SpinRate) / feature_sds$SpinRate,
-    RelHeight_z = (ifelse("RelHeight" %in% names(tm_data), RelHeight, 6) - feature_means$RelHeight) / feature_sds$RelHeight,
-    RelSide_z = (ifelse("RelSide" %in% names(tm_data), RelSide, 0) - feature_means$RelSide) / feature_sds$RelSide,
-    # Add indicator columns if missing
-    SwingIndicator = ifelse("is_swing" %in% names(tm_data), is_swing, as.numeric(PitchCall %in% c("StrikeSwinging", "FoulBall", "InPlay"))),
-    WhiffIndicator = ifelse("is_whiff" %in% names(tm_data), is_whiff, as.numeric(PitchCall == "StrikeSwinging")),
-    ABindicator = ifelse("is_ab" %in% names(tm_data), is_ab, as.numeric(PlayResult %in% c("Out", "FieldersChoice", "Single", "Double", "Triple", "HomeRun"))),
-    HitIndicator = ifelse("is_hit" %in% names(tm_data), is_hit, as.numeric(PlayResult %in% c("Single", "Double", "Triple", "HomeRun"))),
-    PAindicator = ifelse("is_pa" %in% names(tm_data), is_pa, 0),
+    hitter_rv = mean_DRE_bat,
+    # Standardize features using columns (now guaranteed to exist)
+    RelSpeed_z = (RelSpeed - feature_means$RelSpeed) / feature_sds$RelSpeed,
+    IVB_z = (InducedVertBreak - feature_means$InducedVertBreak) / feature_sds$InducedVertBreak,
+    HB_z = (HorzBreak - feature_means$HorzBreak) / feature_sds$HorzBreak,
+    SpinRate_z = (SpinRate - feature_means$SpinRate) / feature_sds$SpinRate,
+    RelHeight_z = (RelHeight - feature_means$RelHeight) / feature_sds$RelHeight,
+    RelSide_z = (RelSide - feature_means$RelSide) / feature_sds$RelSide,
+    # Use indicator columns (already added by add_indicators)
+    SwingIndicator = is_swing,
+    WhiffIndicator = is_whiff,
+    ABindicator = is_ab,
+    HitIndicator = is_hit,
+    PAindicator = is_pa,
     KorBB = case_when(
       is_k == 1 ~ "Strikeout",
       is_walk == 1 ~ "Walk",
