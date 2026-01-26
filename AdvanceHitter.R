@@ -403,7 +403,7 @@ cat("Loaded", nrow(tm_data), "pitch records for", length(all_hitters), "hitters 
 # MAC-STYLE MATCHUP CALCULATION FUNCTION
 # ============================================================================
 
-calculate_mac_matchup <- function(p_name, h_name, distance_threshold = 0.8) {
+calculate_mac_matchup <- function(p_name, h_name, distance_threshold = 1.0) {
   # Get pitcher's arsenal
   p_arsenal <- pitcher_arsenal %>% filter(Pitcher == p_name)
   
@@ -532,7 +532,7 @@ calculate_mac_matchup <- function(p_name, h_name, distance_threshold = 0.8) {
 }
 
 # Calculate pitch type specific matchup (FB, BB, OS)
-calculate_pitch_type_matchup <- function(p_name, h_name, pitch_family, distance_threshold = 0.8) {
+calculate_pitch_type_matchup <- function(p_name, h_name, pitch_family, distance_threshold = 1.0) {
   # Get pitcher's arsenal for specific pitch type
   p_arsenal <- pitcher_arsenal %>% filter(Pitcher == p_name, PitchFamily == pitch_family)
   
@@ -615,12 +615,14 @@ get_matchup_score_color <- function(score) {
 }
 
 # ============================================================================
-# xRV PREDICTIVE MATCHUP MODEL - XGBoost with Bayesian Shrinkage
+# xRV PREDICTIVE MATCHUP MODEL - XGBoost with Pitch Similarity Features
 # ============================================================================
+# Combines pitcher pitch effectiveness with batter performance against similar pitches
+# Uses Euclidean distance <= 1.0 to find similar pitches for batter features
 
 cat("Building xRV Predictive Model...\n")
 
-# Calculate SEC-wide prior distributions for Bayesian shrinkage (by pitch group)
+# Calculate league-wide prior distributions (fallback only when no data)
 calculate_sec_priors <- function(sec_data) {
   sec_data %>%
     filter(!is.na(PitchFamily), !is.na(mean_DRE_bat)) %>%
@@ -634,92 +636,157 @@ calculate_sec_priors <- function(sec_data) {
 }
 
 sec_priors <- calculate_sec_priors(sec_pool_data)
-cat("SEC priors calculated for", nrow(sec_priors), "pitch families\n")
+cat("SEC priors calculated for", nrow(sec_priors), "pitch families (fallback only)\n")
 
-# Build aggregated batter performance data normalized to 300 PA rolling window
-build_batter_xrv_features <- function(tm_data, rolling_pa = 300) {
-  # Aggregate batter performance against each pitch family by pitcher hand
-  batter_perf <- tm_data %>%
-    filter(!is.na(PitchFamily), !is.na(mean_DRE_bat), !is.na(PitcherThrows)) %>%
-    group_by(Batter, PitcherThrows, PitchFamily) %>%
-    summarise(
-      n_pitches = n(),
-      n_pa = sum(is_pa, na.rm = TRUE),
-      raw_xrv = mean(mean_DRE_bat, na.rm = TRUE),
-      whiff_rate = sum(is_whiff, na.rm = TRUE) / pmax(1, sum(is_swing, na.rm = TRUE)),
-      chase_rate = sum(chase, na.rm = TRUE) / pmax(1, sum(out_of_zone, na.rm = TRUE)),
-      zone_contact = 1 - sum(in_zone_whiff, na.rm = TRUE) / pmax(1, sum(z_swing, na.rm = TRUE)),
-      # Pitch characteristic exposure
-      avg_velo_faced = mean(RelSpeed, na.rm = TRUE),
-      avg_ivb_faced = mean(InducedVertBreak, na.rm = TRUE),
-      avg_hb_faced = mean(HorzBreak, na.rm = TRUE),
-      avg_spin_faced = mean(SpinRate, na.rm = TRUE),
-      .groups = "drop"
-    ) %>%
-    filter(n_pitches >= 15)  # Minimum sample for stability
+# ============================================================================
+# BATTER SIMILARITY PERFORMANCE CALCULATOR
+# ============================================================================
+# Calculates batter's performance against pitches similar to a target profile
+# Uses Euclidean distance <= 1.0 in standardized pitch characteristic space
+
+calculate_batter_similar_pitch_performance <- function(batter_name, pitcher_hand, 
+                                                        target_velo, target_ivb, target_hb,
+                                                        target_spin, target_relh, target_rels,
+                                                        distance_threshold = 1.0) {
+  # Get batter's pitch history for this pitcher hand
+  batter_pitches <- batter_pitch_performance %>%
+    filter(Batter == batter_name, PitcherThrows == pitcher_hand)
   
-  # Normalize to rolling 300 PA window with shrinkage
-  # Use PA-weighted credibility factor
-  batter_perf <- batter_perf %>%
+  if (nrow(batter_pitches) < 10) {
+    return(list(xrv_similar = NA, n_similar = 0, whiff_rate = NA, chase_rate = NA))
+  }
+  
+  # Standardize target pitch characteristics
+  target <- list(
+    RelSpeed_z = (target_velo - feature_means$RelSpeed) / feature_sds$RelSpeed,
+    IVB_z = (target_ivb - feature_means$InducedVertBreak) / feature_sds$InducedVertBreak,
+    HB_z = (target_hb - feature_means$HorzBreak) / feature_sds$HorzBreak,
+    SpinRate_z = (target_spin - feature_means$SpinRate) / feature_sds$SpinRate,
+    RelHeight_z = (target_relh - feature_means$RelHeight) / feature_sds$RelHeight,
+    RelSide_z = (target_rels - feature_means$RelSide) / feature_sds$RelSide
+  )
+  
+  # Handle NAs in target
+  target <- lapply(target, function(x) if(is.na(x) || is.nan(x)) 0 else x)
+  
+  # Calculate Euclidean distance for each pitch batter has faced
+  batter_pitches_calc <- batter_pitches %>%
     mutate(
-      credibility = n_pa / (n_pa + rolling_pa * 0.1),  # Shrinkage factor
-      # Get SEC prior for pitch family
-      prior_xrv = case_when(
-        PitchFamily == "FB" ~ sec_priors$prior_mean[sec_priors$PitchFamily == "FB"],
-        PitchFamily == "BB" ~ sec_priors$prior_mean[sec_priors$PitchFamily == "BB"],
-        PitchFamily == "OS" ~ sec_priors$prior_mean[sec_priors$PitchFamily == "OS"],
-        TRUE ~ 0
-      ),
-      # Bayesian shrinkage: blend raw performance with SEC prior
-      xrv_shrunk = credibility * raw_xrv + (1 - credibility) * prior_xrv
+      RelSpeed_z_safe = ifelse(is.na(RelSpeed_z), 0, RelSpeed_z),
+      IVB_z_safe = ifelse(is.na(IVB_z), 0, IVB_z),
+      HB_z_safe = ifelse(is.na(HB_z), 0, HB_z),
+      SpinRate_z_safe = ifelse(is.na(SpinRate_z), 0, SpinRate_z),
+      RelHeight_z_safe = ifelse(is.na(RelHeight_z), 0, RelHeight_z),
+      RelSide_z_safe = ifelse(is.na(RelSide_z), 0, RelSide_z),
+      distance = sqrt(
+        (RelSpeed_z_safe - target$RelSpeed_z)^2 +
+          (IVB_z_safe - target$IVB_z)^2 +
+          (HB_z_safe - target$HB_z)^2 +
+          (SpinRate_z_safe - target$SpinRate_z)^2 +
+          (RelHeight_z_safe - target$RelHeight_z)^2 +
+          (RelSide_z_safe - target$RelSide_z)^2
+      )
     )
   
-  batter_perf
+  # Filter to similar pitches within Euclidean distance threshold
+  similar_pitches <- batter_pitches_calc %>%
+    filter(!is.na(distance), distance <= distance_threshold)
+  
+  n_similar <- nrow(similar_pitches)
+  
+  if (n_similar >= 5) {
+    xrv_similar <- mean(similar_pitches$hitter_rv, na.rm = TRUE)
+    whiff_rate <- sum(similar_pitches$WhiffIndicator, na.rm = TRUE) / 
+                  pmax(1, sum(similar_pitches$SwingIndicator, na.rm = TRUE))
+    chase_rate <- sum(similar_pitches$chase, na.rm = TRUE) / 
+                  pmax(1, sum(similar_pitches$out_of_zone, na.rm = TRUE))
+    
+    return(list(xrv_similar = xrv_similar, n_similar = n_similar, 
+                whiff_rate = whiff_rate, chase_rate = chase_rate))
+  }
+  
+  list(xrv_similar = NA, n_similar = n_similar, whiff_rate = NA, chase_rate = NA)
 }
 
-batter_xrv_features <- build_batter_xrv_features(tm_data, rolling_pa = 300)
-cat("Built xRV features for", n_distinct(batter_xrv_features$Batter), "batters\n")
+# ============================================================================
+# BUILD TRAINING DATA WITH PITCH SIMILARITY FEATURES
+# ============================================================================
 
-# Build training data for XGBoost model
-# Matches batter performance against pitch characteristics and pitcher quality
-build_xrv_training_data <- function(tm_data, batter_features) {
-  # Create training set: each row is a pitch with features
-  train_data <- tm_data %>%
+build_xrv_training_data_with_similarity <- function(tm_data, distance_threshold = 1.0) {
+  cat("Building training data with pitch similarity features...\n")
+  
+  # Sample pitches for training (for memory efficiency)
+  train_pitches <- tm_data %>%
     filter(!is.na(PitchFamily), !is.na(mean_DRE_bat), !is.na(PitcherThrows),
            !is.na(RelSpeed), !is.na(InducedVertBreak), !is.na(HorzBreak)) %>%
-    select(Batter, Pitcher, PitcherThrows, PitchFamily,
-           RelSpeed, InducedVertBreak, HorzBreak, SpinRate, RelHeight, RelSide,
-           mean_DRE_bat, mean_DRE_pit) %>%
-    # Join batter historical performance
-    left_join(
-      batter_features %>%
-        select(Batter, PitcherThrows, PitchFamily, 
-               xrv_shrunk, whiff_rate, chase_rate, zone_contact,
-               n_pitches, credibility),
-      by = c("Batter", "PitcherThrows", "PitchFamily")
-    ) %>%
-    filter(!is.na(xrv_shrunk))  # Must have batter history
+    sample_n(min(50000, n()))
   
-  train_data
+  # For each pitch, calculate batter's historical performance against similar pitches
+  # This is done efficiently by pre-computing batter stats
+  cat("Pre-computing batter similarity stats for", n_distinct(train_pitches$Batter), "batters...\n")
+  
+  # Pre-aggregate batter stats by pitch characteristic bins for efficiency
+  batter_stats_cache <- list()
+  
+  train_with_features <- train_pitches %>%
+    rowwise() %>%
+    mutate(
+      # Calculate batter's performance against similar pitches to this one
+      similar_perf = list(calculate_batter_similar_pitch_performance(
+        Batter, PitcherThrows, RelSpeed, InducedVertBreak, HorzBreak,
+        ifelse(is.na(SpinRate), 2200, SpinRate),
+        ifelse(is.na(RelHeight), 6, RelHeight),
+        ifelse(is.na(RelSide), 0, RelSide),
+        distance_threshold
+      ))
+    ) %>%
+    ungroup() %>%
+    mutate(
+      batter_xrv_vs_similar = sapply(similar_perf, function(x) x$xrv_similar),
+      batter_n_similar = sapply(similar_perf, function(x) x$n_similar),
+      batter_whiff_vs_similar = sapply(similar_perf, function(x) x$whiff_rate),
+      batter_chase_vs_similar = sapply(similar_perf, function(x) x$chase_rate)
+    ) %>%
+    select(-similar_perf) %>%
+    # Filter to rows where we have batter similarity data
+    filter(!is.na(batter_xrv_vs_similar), batter_n_similar >= 5)
+  
+  cat("Built training data with", nrow(train_with_features), "samples\n")
+  train_with_features
 }
 
-# Train XGBoost model for xRV prediction (memory efficient)
-# Incorporates both pitcher quality (mean_DRE_pit) and batter performance
-train_xrv_model <- function(tm_data, batter_features, nrounds = 100, verbose = 0) {
-  cat("Preparing xRV training data...\n")
+# ============================================================================
+# TRAIN XGBOOST MODEL WITH PITCH SIMILARITY FEATURES
+# ============================================================================
+
+train_xrv_model_with_similarity <- function(tm_data, nrounds = 100, verbose = 0, 
+                                             distance_threshold = 1.0) {
+  cat("Training xRV model with pitch similarity features...\n")
   
-  # Build training data
-  train_df <- build_xrv_training_data(tm_data, batter_features)
+  # Build training data with similarity features
+  train_df <- build_xrv_training_data_with_similarity(tm_data, distance_threshold)
   
   if (nrow(train_df) < 1000) {
     cat("Insufficient training data for xRV model\n")
     return(NULL)
   }
   
-  # Define feature columns - includes pitcher quality via mean_DRE_pit
-  feature_cols <- c("RelSpeed", "InducedVertBreak", "HorzBreak", "SpinRate", "RelHeight", "RelSide",
-                    "mean_DRE_pit",  # Pitcher run value for quality adjustment
-                    "xrv_shrunk", "whiff_rate", "chase_rate", "zone_contact", "credibility")
+  # Feature columns:
+  # - Pitcher pitch characteristics (velo, movement, spin, release point)
+  # - Pitcher effectiveness (mean_DRE_pit)
+  # - BATTER's performance against similar pitches (KEY DIFFERENTIATOR)
+  # - Batter whiff/chase rates against similar pitches
+  feature_cols <- c(
+    # Pitcher pitch characteristics
+    "RelSpeed", "InducedVertBreak", "HorzBreak", "SpinRate", "RelHeight", "RelSide",
+    # Pitcher effectiveness
+    "mean_DRE_pit",
+    # BATTER similarity-based features (differentiates hitters)
+    "batter_xrv_vs_similar",      # Batter's actual xRV against similar pitches
+    "batter_n_similar",           # Sample size for credibility
+    "batter_whiff_vs_similar",    # Batter whiff rate vs similar
+    "batter_chase_vs_similar"     # Batter chase rate vs similar
+  )
   
   # Prepare matrix - handle NAs
   X <- train_df %>%
@@ -729,28 +796,21 @@ train_xrv_model <- function(tm_data, batter_features, nrounds = 100, verbose = 0
   
   y <- train_df$mean_DRE_bat
   
-  # Sample down if too large (memory efficiency)
-  max_samples <- 100000
-  if (nrow(X) > max_samples) {
-    idx <- sample(nrow(X), max_samples)
-    X <- X[idx, ]
-    y <- y[idx]
-  }
-  
   cat("Training xRV model on", nrow(X), "samples with", ncol(X), "features...\n")
+  cat("Features:", paste(feature_cols, collapse = ", "), "\n")
   
   # Create DMatrix
   dtrain <- xgb.DMatrix(data = X, label = y)
   
-  # XGBoost parameters optimized for run value prediction
+  # XGBoost parameters - emphasize batter features
   params <- list(
     objective = "reg:squarederror",
-    max_depth = 4,
+    max_depth = 5,
     eta = 0.1,
     subsample = 0.8,
     colsample_bytree = 0.8,
-    min_child_weight = 10,
-    gamma = 0.1
+    min_child_weight = 5,
+    gamma = 0.05
   )
   
   # Train model
@@ -760,6 +820,11 @@ train_xrv_model <- function(tm_data, batter_features, nrounds = 100, verbose = 0
     nrounds = nrounds,
     verbose = verbose
   )
+  
+  # Get feature importance
+  importance <- xgb.importance(feature_names = feature_cols, model = model)
+  cat("\nFeature Importance:\n")
+  print(importance)
   
   # Clean up
   rm(dtrain, X)
@@ -773,40 +838,62 @@ train_xrv_model <- function(tm_data, batter_features, nrounds = 100, verbose = 0
   )
 }
 
-# Train the xRV model
-xrv_model_data <- train_xrv_model(tm_data, batter_xrv_features, nrounds = 100)
+# Train the xRV model with pitch similarity features
+xrv_model_data <- train_xrv_model_with_similarity(tm_data, nrounds = 100, 
+                                                   distance_threshold = 1.0)
 
-# Predict xRV for a specific pitcher-batter matchup
+# Build batter xRV features (for backward compatibility)
+build_batter_xrv_features <- function(tm_data, rolling_pa = 300) {
+  batter_perf <- tm_data %>%
+    filter(!is.na(PitchFamily), !is.na(mean_DRE_bat), !is.na(PitcherThrows)) %>%
+    group_by(Batter, PitcherThrows, PitchFamily) %>%
+    summarise(
+      n_pitches = n(),
+      n_pa = sum(is_pa, na.rm = TRUE),
+      raw_xrv = mean(mean_DRE_bat, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    filter(n_pitches >= 15)
+  
+  batter_perf
+}
+
+batter_xrv_features <- build_batter_xrv_features(tm_data, rolling_pa = 300)
+cat("Built xRV features for", n_distinct(batter_xrv_features$Batter), "batters\n")
+
+# ============================================================================
+# PREDICT xRV MATCHUP USING XGBOOST + PITCH SIMILARITY
+# ============================================================================
+
 predict_xrv_matchup <- function(pitcher_name, batter_name, pitch_family = NULL,
                                  pitcher_arsenal, batter_features, xrv_model,
-                                 sec_priors) {
+                                 sec_priors, distance_threshold = 1.0) {
+  
   # Get pitcher's arsenal
   p_arsenal <- pitcher_arsenal %>% filter(Pitcher == pitcher_name)
   
   if (nrow(p_arsenal) == 0) {
-    return(list(xrv = NA, xrv_per100 = NA, n_batter_pa = 0, confidence = "low"))
+    return(list(xrv = NA, xrv_per100 = NA, n_batter_pa = 0, n_similar = 0, confidence = "low"))
   }
   
   # Filter by pitch family if specified
   if (!is.null(pitch_family)) {
     p_arsenal <- p_arsenal %>% filter(PitchFamily == pitch_family)
     if (nrow(p_arsenal) == 0) {
-      return(list(xrv = NA, xrv_per100 = NA, n_batter_pa = 0, confidence = "low"))
+      return(list(xrv = NA, xrv_per100 = NA, n_batter_pa = 0, n_similar = 0, confidence = "low"))
     }
   }
   
   p_hand <- p_arsenal$PitcherThrows[1]
   
-  # Get batter's performance data
-  batter_perf <- batter_features %>%
+  # Get batter's total pitch history for this hand
+  batter_pitches <- batter_pitch_performance %>%
     filter(Batter == batter_name, PitcherThrows == p_hand)
   
-  if (!is.null(pitch_family)) {
-    batter_perf <- batter_perf %>% filter(PitchFamily == pitch_family)
-  }
+  total_batter_pitches <- nrow(batter_pitches)
   
-  if (nrow(batter_perf) == 0) {
-    # No batter history - use SEC prior
+  if (total_batter_pitches < 20) {
+    # Insufficient batter data - use fallback
     prior_xrv <- if (!is.null(pitch_family)) {
       prior_row <- sec_priors %>% filter(PitchFamily == pitch_family)
       if (nrow(prior_row) > 0) prior_row$prior_mean[1] else 0
@@ -817,106 +904,111 @@ predict_xrv_matchup <- function(pitcher_name, batter_name, pitch_family = NULL,
     return(list(
       xrv = prior_xrv,
       xrv_per100 = prior_xrv * 100,
-      n_batter_pa = 0,
+      n_batter_pa = total_batter_pitches,
+      n_similar = 0,
       confidence = "very_low"
     ))
   }
   
-  # If model available, use XGBoost prediction
-  if (!is.null(xrv_model) && !is.null(xrv_model$model)) {
-    # Build prediction features for each pitch type in arsenal
-    predictions <- list()
-    total_usage <- 0
+  # For each pitch in arsenal, get batter's similar pitch performance and predict xRV
+  predictions <- list()
+  total_similar <- 0
+  total_usage <- 0
+  
+  for (i in 1:nrow(p_arsenal)) {
+    pt <- p_arsenal$PitchFamily[i]
+    usage <- p_arsenal$usage_pct[i]
     
-    for (i in 1:nrow(p_arsenal)) {
-      pt <- p_arsenal$PitchFamily[i]
-      usage <- p_arsenal$usage_pct[i]
+    # Calculate batter's performance against pitches similar to this one
+    similar_perf <- calculate_batter_similar_pitch_performance(
+      batter_name, p_hand,
+      p_arsenal$RelSpeed[i],
+      p_arsenal$InducedVertBreak[i],
+      p_arsenal$HorzBreak[i],
+      ifelse(is.na(p_arsenal$SpinRate[i]), 2200, p_arsenal$SpinRate[i]),
+      ifelse(is.na(p_arsenal$RelHeight[i]), 6, p_arsenal$RelHeight[i]),
+      ifelse(is.na(p_arsenal$RelSide[i]), 0, p_arsenal$RelSide[i]),
+      distance_threshold
+    )
+    
+    total_similar <- total_similar + similar_perf$n_similar
+    
+    # If we have the XGBoost model and batter similarity data, use it for prediction
+    if (!is.null(xrv_model) && !is.null(xrv_model$model) && 
+        !is.na(similar_perf$xrv_similar) && similar_perf$n_similar >= 5) {
       
-      # Get batter perf for this pitch type
-      b_perf <- batter_perf %>% filter(PitchFamily == pt)
+      # Build feature vector for prediction
+      features <- data.frame(
+        RelSpeed = p_arsenal$RelSpeed[i],
+        InducedVertBreak = p_arsenal$InducedVertBreak[i],
+        HorzBreak = p_arsenal$HorzBreak[i],
+        SpinRate = ifelse(is.na(p_arsenal$SpinRate[i]), 2200, p_arsenal$SpinRate[i]),
+        RelHeight = ifelse(is.na(p_arsenal$RelHeight[i]), 6, p_arsenal$RelHeight[i]),
+        RelSide = ifelse(is.na(p_arsenal$RelSide[i]), 0, p_arsenal$RelSide[i]),
+        mean_DRE_pit = ifelse(is.na(p_arsenal$mean_DRE_pit[i]), 0, p_arsenal$mean_DRE_pit[i]),
+        batter_xrv_vs_similar = similar_perf$xrv_similar,
+        batter_n_similar = similar_perf$n_similar,
+        batter_whiff_vs_similar = ifelse(is.na(similar_perf$whiff_rate), 0.25, similar_perf$whiff_rate),
+        batter_chase_vs_similar = ifelse(is.na(similar_perf$chase_rate), 0.28, similar_perf$chase_rate)
+      )
       
-      if (nrow(b_perf) == 0) {
-        # Use SEC prior for this pitch type
-        prior_row <- sec_priors %>% filter(PitchFamily == pt)
-        pred_xrv <- if (nrow(prior_row) > 0) prior_row$prior_mean[1] else 0
-      } else {
-        # Build feature vector including pitcher quality
-        pit_dre <- if (!is.na(p_arsenal$mean_DRE_pit[i])) p_arsenal$mean_DRE_pit[i] else 0
-        
-        features <- data.frame(
-          RelSpeed = p_arsenal$RelSpeed[i],
-          InducedVertBreak = p_arsenal$InducedVertBreak[i],
-          HorzBreak = p_arsenal$HorzBreak[i],
-          SpinRate = ifelse(is.na(p_arsenal$SpinRate[i]), 2200, p_arsenal$SpinRate[i]),
-          RelHeight = ifelse(is.na(p_arsenal$RelHeight[i]), 6, p_arsenal$RelHeight[i]),
-          RelSide = ifelse(is.na(p_arsenal$RelSide[i]), 0, p_arsenal$RelSide[i]),
-          mean_DRE_pit = pit_dre,  # Pitcher quality adjustment
-          xrv_shrunk = b_perf$xrv_shrunk[1],
-          whiff_rate = ifelse(is.na(b_perf$whiff_rate[1]), 0.25, b_perf$whiff_rate[1]),
-          chase_rate = ifelse(is.na(b_perf$chase_rate[1]), 0.28, b_perf$chase_rate[1]),
-          zone_contact = ifelse(is.na(b_perf$zone_contact[1]), 0.85, b_perf$zone_contact[1]),
-          credibility = b_perf$credibility[1]
-        )
-        
-        # Replace any remaining NAs with 0
-        features[is.na(features)] <- 0
-        
-        X_pred <- as.matrix(features)
-        pred_xrv <- predict(xrv_model$model, X_pred)[1]
-      }
+      features[is.na(features)] <- 0
+      X_pred <- as.matrix(features)
+      pred_xrv <- predict(xrv_model$model, X_pred)[1]
       
-      predictions[[pt]] <- list(xrv = pred_xrv, usage = usage)
-      total_usage <- total_usage + usage
+    } else if (!is.na(similar_perf$xrv_similar) && similar_perf$n_similar >= 5) {
+      # Fallback: use batter's raw similar pitch performance with light shrinkage
+      k <- 30
+      shrinkage <- similar_perf$n_similar / (similar_perf$n_similar + k)
+      pred_xrv <- shrinkage * similar_perf$xrv_similar + (1 - shrinkage) * 0
+      
+    } else {
+      # No similar pitch data - use neutral
+      pred_xrv <- 0
     }
     
-    # Calculate weighted xRV across arsenal
-    if (total_usage > 0) {
-      weighted_xrv <- sum(sapply(names(predictions), function(pt) {
-        predictions[[pt]]$xrv * predictions[[pt]]$usage
-      })) / total_usage
-    } else {
-      weighted_xrv <- mean(sapply(predictions, function(x) x$xrv))
-    }
-  } else {
-    # Fallback: use shrunk batter performance directly
-    if (!is.null(pitch_family)) {
-      weighted_xrv <- mean(batter_perf$xrv_shrunk, na.rm = TRUE)
-    } else {
-      # Weight by pitcher's usage
-      weighted_xrv <- 0
-      total_usage <- 0
-      for (i in 1:nrow(p_arsenal)) {
-        pt <- p_arsenal$PitchFamily[i]
-        usage <- p_arsenal$usage_pct[i]
-        b_pt <- batter_perf %>% filter(PitchFamily == pt)
-        if (nrow(b_pt) > 0) {
-          weighted_xrv <- weighted_xrv + b_pt$xrv_shrunk[1] * usage
-          total_usage <- total_usage + usage
-        }
-      }
-      if (total_usage > 0) {
-        weighted_xrv <- weighted_xrv / total_usage
-      } else {
-        weighted_xrv <- mean(batter_perf$xrv_shrunk, na.rm = TRUE)
-      }
-    }
+    predictions[[pt]] <- list(xrv = pred_xrv, usage = usage, n_similar = similar_perf$n_similar)
+    total_usage <- total_usage + usage
   }
   
-  # Calculate confidence based on batter sample
-  total_pa <- sum(batter_perf$n_pitches, na.rm = TRUE)
-  avg_cred <- mean(batter_perf$credibility, na.rm = TRUE)
+  # Calculate weighted xRV across arsenal
+  if (total_usage > 0 && length(predictions) > 0) {
+    weighted_xrv <- sum(sapply(names(predictions), function(pt) {
+      pred <- predictions[[pt]]
+      if (pred$n_similar >= 5) {
+        pred$xrv * (pred$usage^1.5)
+      } else {
+        0
+      }
+    }))
+    
+    total_weight <- sum(sapply(names(predictions), function(pt) {
+      pred <- predictions[[pt]]
+      if (pred$n_similar >= 5) pred$usage^1.5 else 0
+    }))
+    
+    if (total_weight > 0) {
+      weighted_xrv <- weighted_xrv / total_weight
+    } else {
+      weighted_xrv <- 0
+    }
+  } else {
+    weighted_xrv <- 0
+  }
   
+  # Confidence based on total similar pitches found
   confidence <- case_when(
-    total_pa >= 200 && avg_cred >= 0.7 ~ "high",
-    total_pa >= 100 && avg_cred >= 0.5 ~ "medium",
-    total_pa >= 50 ~ "low",
+    total_similar >= 100 ~ "high",
+    total_similar >= 50 ~ "medium",
+    total_similar >= 20 ~ "low",
     TRUE ~ "very_low"
   )
   
   list(
     xrv = weighted_xrv,
     xrv_per100 = weighted_xrv * 100,
-    n_batter_pa = total_pa,
+    n_batter_pa = total_batter_pitches,
+    n_similar = total_similar,
     confidence = confidence
   )
 }
@@ -926,18 +1018,24 @@ calculate_xrv_matchup <- function(pitcher_name, batter_name,
                                    pitcher_arsenal = pitcher_arsenal,
                                    batter_features = batter_xrv_features,
                                    xrv_model = xrv_model_data,
-                                   sec_priors = sec_priors) {
-  # Overall xRV
+                                   sec_priors = sec_priors,
+                                   distance_threshold = 1.0) {
+  
+  # Overall xRV prediction
   overall <- predict_xrv_matchup(pitcher_name, batter_name, NULL,
-                                  pitcher_arsenal, batter_features, xrv_model, sec_priors)
+                                  pitcher_arsenal, batter_features, xrv_model, sec_priors,
+                                  distance_threshold)
   
   # By pitch group
   fb_result <- predict_xrv_matchup(pitcher_name, batter_name, "FB",
-                                    pitcher_arsenal, batter_features, xrv_model, sec_priors)
+                                    pitcher_arsenal, batter_features, xrv_model, sec_priors,
+                                    distance_threshold)
   bb_result <- predict_xrv_matchup(pitcher_name, batter_name, "BB",
-                                    pitcher_arsenal, batter_features, xrv_model, sec_priors)
+                                    pitcher_arsenal, batter_features, xrv_model, sec_priors,
+                                    distance_threshold)
   os_result <- predict_xrv_matchup(pitcher_name, batter_name, "OS",
-                                    pitcher_arsenal, batter_features, xrv_model, sec_priors)
+                                    pitcher_arsenal, batter_features, xrv_model, sec_priors,
+                                    distance_threshold)
   
   list(
     overall_xrv = overall$xrv_per100,
@@ -945,7 +1043,8 @@ calculate_xrv_matchup <- function(pitcher_name, batter_name,
     bb_xrv = bb_result$xrv_per100,
     os_xrv = os_result$xrv_per100,
     confidence = overall$confidence,
-    n_pa = overall$n_batter_pa
+    n_pa = overall$n_batter_pa,
+    n_similar = overall$n_similar
   )
 }
 
@@ -1952,7 +2051,7 @@ app_ui <- fluidPage(
     tabPanel("xRV Matchup Matrix",
       div(class = "stats-header", 
           h3("xRV Matchup Predictions"), 
-          p("Expected Run Value (xRV) predictions based on pitcher arsenal vs batter performance with SEC Bayesian priors")),
+          p("XGBoost predictive model combining pitcher effectiveness with batter's performance against similar pitches (Euclidean distance ≤ 1.0)")),
       
       fluidRow(
         column(12,
@@ -2816,7 +2915,7 @@ output$download_scout_pdf <- downloadHandler(
       return(div(style = "text-align: center; padding: 40px; color: #666;",
                  p("Select pitchers and hitters, then click 'Generate xRV Matrix' to see predicted matchup values."),
                  p(style = "font-size: 12px; margin-top: 10px;", 
-                   "The model uses pitcher arsenal characteristics (velocity, movement, spin) and batter historical performance with SEC Bayesian priors.")))
+                   "XGBoost model predicts xRV using pitcher's pitch characteristics + batter's actual performance against similar pitches (Euclidean distance ≤ 1.0).")))
     }
     
     results <- data$results
@@ -2886,9 +2985,9 @@ output$download_scout_pdf <- downloadHandler(
                      "BB: ", format_xrv(matchup$bb_xrv))
           ),
           
-          # Confidence indicator
+          # Confidence indicator with similar pitch count
           div(style = "text-align: center; font-size: 9px; color: #666; margin-bottom: 3px;",
-              paste0("(", matchup$confidence, ")")),
+              paste0("(", matchup$confidence, ", n=", ifelse(is.null(matchup$n_similar), "?", matchup$n_similar), ")")),
           
           # Notes input
           tags$textarea(
