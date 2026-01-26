@@ -393,6 +393,169 @@ batter_pitch_performance <- tm_data %>%
 # Get list of all pitchers for dropdown
 all_pitchers <- sort(unique(tm_data$Pitcher))
 
+# ============================================================================
+# PRE-BIN BATTER PERFORMANCE AGAINST PITCH PROFILES AT STARTUP
+# ============================================================================
+# This pre-computation reduces model load times by caching aggregated stats
+
+cat("Pre-binning batter performance against pitch profiles...\n")
+
+# Define pitch type groups for advanced heat maps
+classify_detailed_pitch <- function(pitch_type) {
+  case_when(
+    pitch_type %in% c("Fastball", "Four-Seam", "FourSeamFastBall", "FF") ~ "4S",
+    pitch_type %in% c("TwoSeamFastBall", "Sinker", "SI", "FT") ~ "2S/Si",
+    pitch_type %in% c("Slider", "Sweeper", "SL", "SW") ~ "SL/SW",
+    pitch_type %in% c("Curveball", "Cutter", "CU", "CB", "KC", "FC", "SV") ~ "CB",
+    pitch_type %in% c("Changeup", "ChangeUp", "Splitter", "CH", "FS", "SP") ~ "CH/Spl",
+    TRUE ~ "Other"
+  )
+}
+
+# Add detailed pitch classification to batter_pitch_performance
+batter_pitch_performance <- batter_pitch_performance %>%
+  mutate(DetailedPitchType = classify_detailed_pitch(TaggedPitchType))
+
+# Pre-bin batter performance by pitch type and pitcher hand
+batter_pitch_profile_cache <- batter_pitch_performance %>%
+  filter(!is.na(Batter), !is.na(PitcherThrows)) %>%
+  group_by(Batter, PitcherThrows, DetailedPitchType) %>%
+  summarise(
+    n_pitches = n(),
+    n_swings = sum(SwingIndicator, na.rm = TRUE),
+    n_whiffs = sum(WhiffIndicator, na.rm = TRUE),
+    n_in_zone = sum(in_zone, na.rm = TRUE),
+    n_out_zone = sum(out_of_zone, na.rm = TRUE),
+    n_chase = sum(chase, na.rm = TRUE),
+    n_iz_swing = sum(z_swing, na.rm = TRUE),
+    n_iz_whiff = sum(in_zone_whiff, na.rm = TRUE),
+    n_bip = sum(PitchCall == "InPlay", na.rm = TRUE),
+    n_damage = sum(PitchCall == "InPlay" & ExitSpeed >= 95, na.rm = TRUE),
+    woba_sum = sum(woba, na.rm = TRUE),
+    woba_n = sum(!is.na(woba)),
+    rv_sum = sum(mean_DRE_bat, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    pitch_freq = n_pitches,
+    swing_pct = ifelse(n_pitches > 0, 100 * n_swings / n_pitches, NA),
+    whiff_pct = ifelse(n_swings > 0, 100 * n_whiffs / n_swings, NA),
+    woba = ifelse(woba_n > 0, woba_sum / woba_n, NA),
+    damage_pct = ifelse(n_bip > 0, 100 * n_damage / n_bip, NA),
+    chase_pct = ifelse(n_out_zone > 0, 100 * n_chase / n_out_zone, NA),
+    iz_whiff_pct = ifelse(n_iz_swing > 0, 100 * n_iz_whiff / n_iz_swing, NA),
+    iz_damage_pct = ifelse(n_in_zone > 0, 100 * n_damage / pmax(1, n_bip), NA)
+  )
+
+# Pre-bin batter performance by count type and pitcher hand
+batter_count_profile_cache <- batter_pitch_performance %>%
+  filter(!is.na(Batter), !is.na(PitcherThrows)) %>%
+  mutate(
+    CountType = case_when(
+      Balls == 0 & Strikes == 0 ~ "1P",
+      Strikes == 2 ~ "2K",
+      Strikes > Balls ~ "Ahead",
+      Balls > Strikes ~ "Behind",
+      TRUE ~ "Even"
+    )
+  ) %>%
+  group_by(Batter, PitcherThrows, CountType) %>%
+  summarise(
+    n_pitches = n(),
+    n_swings = sum(SwingIndicator, na.rm = TRUE),
+    n_whiffs = sum(WhiffIndicator, na.rm = TRUE),
+    n_in_zone = sum(in_zone, na.rm = TRUE),
+    n_out_zone = sum(out_of_zone, na.rm = TRUE),
+    n_chase = sum(chase, na.rm = TRUE),
+    n_iz_swing = sum(z_swing, na.rm = TRUE),
+    n_iz_whiff = sum(in_zone_whiff, na.rm = TRUE),
+    n_bip = sum(PitchCall == "InPlay", na.rm = TRUE),
+    n_damage = sum(PitchCall == "InPlay" & ExitSpeed >= 95, na.rm = TRUE),
+    woba_sum = sum(woba, na.rm = TRUE),
+    woba_n = sum(!is.na(woba)),
+    rv_sum = sum(mean_DRE_bat, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    pitch_freq = n_pitches,
+    swing_pct = ifelse(n_pitches > 0, 100 * n_swings / n_pitches, NA),
+    whiff_pct = ifelse(n_swings > 0, 100 * n_whiffs / n_swings, NA),
+    woba = ifelse(woba_n > 0, woba_sum / woba_n, NA),
+    damage_pct = ifelse(n_bip > 0, 100 * n_damage / n_bip, NA),
+    chase_pct = ifelse(n_out_zone > 0, 100 * n_chase / n_out_zone, NA),
+    iz_whiff_pct = ifelse(n_iz_swing > 0, 100 * n_iz_whiff / n_iz_swing, NA),
+    iz_damage_pct = ifelse(n_in_zone > 0, 100 * n_damage / pmax(1, n_bip), NA)
+  )
+
+# Pre-compute last 15 games data for each batter
+batter_last15_cache <- batter_pitch_performance %>%
+  filter(!is.na(Batter), !is.na(Date)) %>%
+  group_by(Batter) %>%
+  arrange(desc(as.Date(Date))) %>%
+  mutate(game_rank = dense_rank(desc(as.Date(Date)))) %>%
+  filter(game_rank <= 15) %>%
+  group_by(Batter, PitcherThrows) %>%
+  summarise(
+    n_pitches = n(),
+    n_swings = sum(SwingIndicator, na.rm = TRUE),
+    n_whiffs = sum(WhiffIndicator, na.rm = TRUE),
+    n_in_zone = sum(in_zone, na.rm = TRUE),
+    n_out_zone = sum(out_of_zone, na.rm = TRUE),
+    n_chase = sum(chase, na.rm = TRUE),
+    n_iz_swing = sum(z_swing, na.rm = TRUE),
+    n_iz_whiff = sum(in_zone_whiff, na.rm = TRUE),
+    n_bip = sum(PitchCall == "InPlay", na.rm = TRUE),
+    n_damage = sum(PitchCall == "InPlay" & ExitSpeed >= 95, na.rm = TRUE),
+    woba_sum = sum(woba, na.rm = TRUE),
+    woba_n = sum(!is.na(woba)),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    pitch_freq = n_pitches,
+    swing_pct = ifelse(n_pitches > 0, 100 * n_swings / n_pitches, NA),
+    whiff_pct = ifelse(n_swings > 0, 100 * n_whiffs / n_swings, NA),
+    woba = ifelse(woba_n > 0, woba_sum / woba_n, NA),
+    damage_pct = ifelse(n_bip > 0, 100 * n_damage / n_bip, NA),
+    chase_pct = ifelse(n_out_zone > 0, 100 * n_chase / n_out_zone, NA),
+    iz_whiff_pct = ifelse(n_iz_swing > 0, 100 * n_iz_whiff / n_iz_swing, NA),
+    iz_damage_pct = ifelse(n_in_zone > 0, 100 * n_damage / pmax(1, n_bip), NA)
+  )
+
+# Pre-compute overall batter stats by pitcher hand
+batter_overall_cache <- batter_pitch_performance %>%
+  filter(!is.na(Batter), !is.na(PitcherThrows)) %>%
+  group_by(Batter, PitcherThrows) %>%
+  summarise(
+    n_pitches = n(),
+    n_swings = sum(SwingIndicator, na.rm = TRUE),
+    n_whiffs = sum(WhiffIndicator, na.rm = TRUE),
+    n_in_zone = sum(in_zone, na.rm = TRUE),
+    n_out_zone = sum(out_of_zone, na.rm = TRUE),
+    n_chase = sum(chase, na.rm = TRUE),
+    n_iz_swing = sum(z_swing, na.rm = TRUE),
+    n_iz_whiff = sum(in_zone_whiff, na.rm = TRUE),
+    n_bip = sum(PitchCall == "InPlay", na.rm = TRUE),
+    n_damage = sum(PitchCall == "InPlay" & ExitSpeed >= 95, na.rm = TRUE),
+    woba_sum = sum(woba, na.rm = TRUE),
+    woba_n = sum(!is.na(woba)),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    pitch_freq = n_pitches,
+    swing_pct = ifelse(n_pitches > 0, 100 * n_swings / n_pitches, NA),
+    whiff_pct = ifelse(n_swings > 0, 100 * n_whiffs / n_swings, NA),
+    woba = ifelse(woba_n > 0, woba_sum / woba_n, NA),
+    damage_pct = ifelse(n_bip > 0, 100 * n_damage / n_bip, NA),
+    chase_pct = ifelse(n_out_zone > 0, 100 * n_chase / n_out_zone, NA),
+    iz_whiff_pct = ifelse(n_iz_swing > 0, 100 * n_iz_whiff / n_iz_swing, NA),
+    iz_damage_pct = ifelse(n_in_zone > 0, 100 * n_damage / pmax(1, n_bip), NA)
+  )
+
+cat("Pre-binned performance data for", n_distinct(batter_pitch_profile_cache$Batter), "batters\n")
+cat("  - Pitch type profiles:", nrow(batter_pitch_profile_cache), "records\n")
+cat("  - Count profiles:", nrow(batter_count_profile_cache), "records\n")
+cat("  - Last 15 games:", nrow(batter_last15_cache), "records\n")
+
 # Memory cleanup after initial data processing
 cat("Data loading complete. Memory cleanup...\n")
 gc(verbose = FALSE)
@@ -1897,6 +2060,346 @@ create_hit_out_chart <- function(tm_data, batter_name, chart_type = "overall_hit
 }
 
 # ============================================================================
+# ADVANCED HEAT MAP WITH STATS - For detailed pitch profile analysis
+# ============================================================================
+
+create_advanced_heatmap_with_stats <- function(data, title = "Heatmap", stat_value = NA, n_pitches = NA,
+                                                colors = c("white", "#FFCCCC", "#FF6666", "#CC0000"),
+                                                type = "whiff") {
+  if (is.null(data)) return(create_base_zone(title, 0))
+  
+  plot_data <- switch(type,
+    "whiff" = data %>% filter(is_whiff == 1),
+    "chase" = data %>% filter(chase == 1),
+    "damage" = data %>% filter((is_hit == 1) | (PitchCall == "InPlay" & ExitSpeed >= 95)),
+    "swing" = data %>% filter(is_swing == 1),
+    "iz_whiff" = data %>% filter(in_zone_whiff == 1),
+    data)
+  plot_data <- plot_data %>% filter(!is.na(PlateLocSide), !is.na(PlateLocHeight))
+  
+  # Format stat display
+  stat_text <- if (!is.na(stat_value)) {
+    if (stat_value > 1) sprintf("%.1f%%", stat_value) else sprintf("%.3f", stat_value)
+  } else "-"
+  n_text <- if (!is.na(n_pitches)) paste0("n=", n_pitches) else ""
+  
+  if (nrow(plot_data) < 3) {
+    # Return minimal zone with stats overlay
+    p <- ggplot() +
+      annotate("rect", xmin = -0.83, xmax = 0.83, ymin = 1.5, ymax = 3.5, fill = "#f5f5f5", color = "black", linewidth = 0.8) +
+      annotate("path", x = c(-0.708, 0.708, 0.708, 0, -0.708, -0.708), y = c(0.15, 0.15, 0.3, 0.5, 0.3, 0.15), color = "black", linewidth = 0.6) +
+      annotate("text", x = 0, y = 2.5, label = stat_text, size = 4, fontface = "bold", color = "#333") +
+      annotate("text", x = 0, y = 4.2, label = title, size = 2.5, fontface = "bold") +
+      annotate("text", x = 1.3, y = 3.8, label = n_text, size = 2, color = "gray50") +
+      coord_fixed(xlim = c(-2, 2), ylim = c(0, 4.5)) + theme_void()
+    return(p)
+  }
+  
+  ggplot(plot_data, aes(x = PlateLocSide, y = PlateLocHeight)) +
+    stat_density_2d(aes(fill = after_stat(density)), geom = "raster", contour = FALSE, alpha = 0.8) +
+    scale_fill_gradientn(colours = colors, guide = "none") +
+    annotate("rect", xmin = -0.83, xmax = 0.83, ymin = 1.5, ymax = 3.5, fill = NA, color = "black", linewidth = 0.8) +
+    annotate("path", x = c(-0.708, 0.708, 0.708, 0, -0.708, -0.708), y = c(0.15, 0.15, 0.3, 0.5, 0.3, 0.15), color = "black", linewidth = 0.6) +
+    # Stats overlay
+    annotate("rect", xmin = -0.5, xmax = 0.5, ymin = 2.2, ymax = 2.8, fill = "white", color = NA, alpha = 0.85) +
+    annotate("text", x = 0, y = 2.5, label = stat_text, size = 3.5, fontface = "bold", color = "#333") +
+    annotate("text", x = 0, y = 4.2, label = title, size = 2.5, fontface = "bold") +
+    annotate("text", x = 1.3, y = 3.8, label = n_text, size = 2, color = "gray50") +
+    coord_fixed(xlim = c(-2, 2), ylim = c(0, 4.5)) +
+    theme_void() + theme(legend.position = "none")
+}
+
+# ============================================================================
+# ADVANCED HEAT MAP STATS TABLE GENERATOR
+# ============================================================================
+
+# Generate advanced heat map stats table for a batter
+get_advanced_heatmap_stats <- function(batter_name, pitcher_hand, split_type = "pitch_type") {
+  # Stats columns: Pitch Frequency, Swing%, wOBA, Damage (95+), Chase, Whiff, IZ Whiff, IZ Damage
+  
+  if (split_type == "pitch_type") {
+    # Split by pitch type: 4S, 2S/Si, SL/SW, CB, CH/Spl, Overall
+    pitch_types <- c("4S", "2S/Si", "SL/SW", "CB", "CH/Spl")
+    
+    # Get data from cache
+    cached_data <- batter_pitch_profile_cache %>%
+      filter(Batter == batter_name, PitcherThrows == pitcher_hand)
+    
+    # Build stats for each pitch type
+    stats_list <- lapply(pitch_types, function(pt) {
+      pt_data <- cached_data %>% filter(DetailedPitchType == pt)
+      if (nrow(pt_data) == 0) {
+        return(list(
+          pitch_type = pt,
+          n = 0, pitch_freq = 0, swing_pct = NA, woba = NA,
+          damage_pct = NA, chase_pct = NA, whiff_pct = NA, 
+          iz_whiff_pct = NA, iz_damage_pct = NA
+        ))
+      }
+      list(
+        pitch_type = pt,
+        n = pt_data$n_pitches[1],
+        pitch_freq = pt_data$n_pitches[1],
+        swing_pct = pt_data$swing_pct[1],
+        woba = pt_data$woba[1],
+        damage_pct = pt_data$damage_pct[1],
+        chase_pct = pt_data$chase_pct[1],
+        whiff_pct = pt_data$whiff_pct[1],
+        iz_whiff_pct = pt_data$iz_whiff_pct[1],
+        iz_damage_pct = pt_data$iz_damage_pct[1]
+      )
+    })
+    
+    # Add overall row
+    overall_data <- batter_overall_cache %>%
+      filter(Batter == batter_name, PitcherThrows == pitcher_hand)
+    
+    if (nrow(overall_data) > 0) {
+      stats_list[[length(stats_list) + 1]] <- list(
+        pitch_type = "Overall",
+        n = overall_data$n_pitches[1],
+        pitch_freq = overall_data$n_pitches[1],
+        swing_pct = overall_data$swing_pct[1],
+        woba = overall_data$woba[1],
+        damage_pct = overall_data$damage_pct[1],
+        chase_pct = overall_data$chase_pct[1],
+        whiff_pct = overall_data$whiff_pct[1],
+        iz_whiff_pct = overall_data$iz_whiff_pct[1],
+        iz_damage_pct = overall_data$iz_damage_pct[1]
+      )
+    }
+    
+    return(stats_list)
+    
+  } else if (split_type == "count_type") {
+    # Split by count type: 1P, 2K, Ahead, Behind, Last 15
+    count_types <- c("1P", "2K", "Ahead", "Behind")
+    
+    # Get data from cache
+    cached_data <- batter_count_profile_cache %>%
+      filter(Batter == batter_name, PitcherThrows == pitcher_hand)
+    
+    # Build stats for each count type
+    stats_list <- lapply(count_types, function(ct) {
+      ct_data <- cached_data %>% filter(CountType == ct)
+      if (nrow(ct_data) == 0) {
+        return(list(
+          count_type = ct,
+          n = 0, pitch_freq = 0, swing_pct = NA, woba = NA,
+          damage_pct = NA, chase_pct = NA, whiff_pct = NA,
+          iz_whiff_pct = NA, iz_damage_pct = NA
+        ))
+      }
+      list(
+        count_type = ct,
+        n = ct_data$n_pitches[1],
+        pitch_freq = ct_data$n_pitches[1],
+        swing_pct = ct_data$swing_pct[1],
+        woba = ct_data$woba[1],
+        damage_pct = ct_data$damage_pct[1],
+        chase_pct = ct_data$chase_pct[1],
+        whiff_pct = ct_data$whiff_pct[1],
+        iz_whiff_pct = ct_data$iz_whiff_pct[1],
+        iz_damage_pct = ct_data$iz_damage_pct[1]
+      )
+    })
+    
+    # Add Last 15 row from cache
+    last15_data <- batter_last15_cache %>%
+      filter(Batter == batter_name, PitcherThrows == pitcher_hand)
+    
+    if (nrow(last15_data) > 0) {
+      stats_list[[length(stats_list) + 1]] <- list(
+        count_type = "Last 15",
+        n = last15_data$n_pitches[1],
+        pitch_freq = last15_data$n_pitches[1],
+        swing_pct = last15_data$swing_pct[1],
+        woba = last15_data$woba[1],
+        damage_pct = last15_data$damage_pct[1],
+        chase_pct = last15_data$chase_pct[1],
+        whiff_pct = last15_data$whiff_pct[1],
+        iz_whiff_pct = last15_data$iz_whiff_pct[1],
+        iz_damage_pct = last15_data$iz_damage_pct[1]
+      )
+    } else {
+      stats_list[[length(stats_list) + 1]] <- list(
+        count_type = "Last 15",
+        n = 0, pitch_freq = 0, swing_pct = NA, woba = NA,
+        damage_pct = NA, chase_pct = NA, whiff_pct = NA,
+        iz_whiff_pct = NA, iz_damage_pct = NA
+      )
+    }
+    
+    return(stats_list)
+  }
+  
+  return(list())
+}
+
+# ============================================================================
+# TREND CHARTS - Rolling stat averages by game date
+# ============================================================================
+
+create_trend_chart <- function(batter_name, tm_data, selected_stats = c("swing_pct", "woba", "chase_pct", "whiff_pct"),
+                               start_date = NULL, end_date = NULL, rolling_games = 5) {
+  # Get batter data with dates
+  h_data <- tm_data %>%
+    filter(Batter == batter_name, !is.na(Date)) %>%
+    mutate(Date = as.Date(Date))
+  
+  if (nrow(h_data) < 10) {
+    return(ggplot() + theme_void() + 
+             annotate("text", x = 0.5, y = 0.5, label = "Insufficient data for trend analysis", size = 4, color = "gray50"))
+  }
+  
+  # Apply date filter if specified
+  if (!is.null(start_date)) {
+    h_data <- h_data %>% filter(Date >= as.Date(start_date))
+  }
+  if (!is.null(end_date)) {
+    h_data <- h_data %>% filter(Date <= as.Date(end_date))
+  }
+  
+  if (nrow(h_data) < 10) {
+    return(ggplot() + theme_void() + 
+             annotate("text", x = 0.5, y = 0.5, label = "Insufficient data in selected date range", size = 4, color = "gray50"))
+  }
+  
+  # Calculate daily stats
+  daily_stats <- h_data %>%
+    group_by(Date) %>%
+    summarise(
+      n_pitches = n(),
+      n_swings = sum(is_swing, na.rm = TRUE),
+      n_whiffs = sum(is_whiff, na.rm = TRUE),
+      n_out_zone = sum(out_of_zone, na.rm = TRUE),
+      n_chase = sum(chase, na.rm = TRUE),
+      n_in_zone = sum(in_zone, na.rm = TRUE),
+      n_iz_swing = sum(z_swing, na.rm = TRUE),
+      n_iz_whiff = sum(in_zone_whiff, na.rm = TRUE),
+      n_bip = sum(PitchCall == "InPlay", na.rm = TRUE),
+      n_damage = sum(PitchCall == "InPlay" & ExitSpeed >= 95, na.rm = TRUE),
+      woba_sum = sum(woba, na.rm = TRUE),
+      woba_n = sum(!is.na(woba)),
+      .groups = "drop"
+    ) %>%
+    arrange(Date) %>%
+    mutate(
+      swing_pct = ifelse(n_pitches > 0, 100 * n_swings / n_pitches, NA),
+      whiff_pct = ifelse(n_swings > 0, 100 * n_whiffs / n_swings, NA),
+      chase_pct = ifelse(n_out_zone > 0, 100 * n_chase / n_out_zone, NA),
+      woba = ifelse(woba_n > 0, woba_sum / woba_n, NA),
+      iz_whiff_pct = ifelse(n_iz_swing > 0, 100 * n_iz_whiff / n_iz_swing, NA),
+      iz_damage_pct = ifelse(n_bip > 0, 100 * n_damage / n_bip, NA)
+    )
+  
+  # Calculate rolling averages
+  calc_rolling_avg <- function(values, window = rolling_games) {
+    n <- length(values)
+    result <- rep(NA, n)
+    for (i in window:n) {
+      window_vals <- values[(i - window + 1):i]
+      result[i] <- mean(window_vals, na.rm = TRUE)
+    }
+    result
+  }
+  
+  daily_stats <- daily_stats %>%
+    mutate(
+      swing_pct_roll = calc_rolling_avg(swing_pct),
+      whiff_pct_roll = calc_rolling_avg(whiff_pct),
+      chase_pct_roll = calc_rolling_avg(chase_pct),
+      woba_roll = calc_rolling_avg(woba),
+      iz_whiff_pct_roll = calc_rolling_avg(iz_whiff_pct),
+      iz_damage_pct_roll = calc_rolling_avg(iz_damage_pct)
+    )
+  
+  # Prepare data for plotting
+  stat_mapping <- list(
+    "swing_pct" = list(col = "swing_pct_roll", label = "Swing%", color = "#1976D2"),
+    "woba" = list(col = "woba_roll", label = "wOBA", color = "#388E3C"),
+    "chase_pct" = list(col = "chase_pct_roll", label = "Chase%", color = "#F57C00"),
+    "whiff_pct" = list(col = "whiff_pct_roll", label = "Whiff%", color = "#D32F2F"),
+    "iz_whiff_pct" = list(col = "iz_whiff_pct_roll", label = "IZ Whiff%", color = "#7B1FA2"),
+    "iz_damage_pct" = list(col = "iz_damage_pct_roll", label = "IZ Damage%", color = "#00796B")
+  )
+  
+  # Filter to selected stats
+  plot_data <- daily_stats %>%
+    select(Date, ends_with("_roll")) %>%
+    pivot_longer(cols = -Date, names_to = "stat", values_to = "value") %>%
+    mutate(
+      stat_clean = gsub("_roll", "", stat),
+      stat_label = sapply(stat_clean, function(s) {
+        if (s %in% names(stat_mapping)) stat_mapping[[s]]$label else s
+      }),
+      stat_color = sapply(stat_clean, function(s) {
+        if (s %in% names(stat_mapping)) stat_mapping[[s]]$color else "gray50"
+      })
+    ) %>%
+    filter(stat_clean %in% selected_stats, !is.na(value))
+  
+  if (nrow(plot_data) == 0) {
+    return(ggplot() + theme_void() + 
+             annotate("text", x = 0.5, y = 0.5, label = "No data for selected stats", size = 4, color = "gray50"))
+  }
+  
+  # Create separate scales for wOBA vs percentage stats
+  # wOBA is typically 0.200-0.500, percentages are 0-100
+  has_woba <- "woba" %in% selected_stats
+  has_pct <- any(selected_stats %in% c("swing_pct", "whiff_pct", "chase_pct", "iz_whiff_pct", "iz_damage_pct"))
+  
+  # Build the plot
+  color_vals <- setNames(
+    sapply(selected_stats, function(s) stat_mapping[[s]]$color),
+    sapply(selected_stats, function(s) stat_mapping[[s]]$label)
+  )
+  
+  p <- ggplot(plot_data, aes(x = Date, y = value, color = stat_label, group = stat_label)) +
+    geom_line(linewidth = 1.2, alpha = 0.9) +
+    geom_point(size = 2, alpha = 0.7) +
+    scale_color_manual(values = color_vals) +
+    labs(
+      title = paste0("Rolling ", rolling_games, "-Game Trends: ", batter_name),
+      x = "Date", y = "Value",
+      color = "Stat"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 12),
+      legend.position = "bottom",
+      legend.title = element_text(size = 9),
+      legend.text = element_text(size = 8),
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+      axis.text.y = element_text(size = 9),
+      panel.grid.minor = element_blank()
+    )
+  
+  # Add facets if mixing wOBA (different scale) with percentages
+  if (has_woba && has_pct) {
+    p <- p + facet_wrap(~stat_label, scales = "free_y", ncol = 2)
+  }
+  
+  p
+}
+
+# Helper function to get date range for a batter
+get_batter_date_range <- function(batter_name, tm_data) {
+  h_data <- tm_data %>%
+    filter(Batter == batter_name, !is.na(Date)) %>%
+    mutate(Date = as.Date(Date))
+  
+  if (nrow(h_data) == 0) {
+    return(list(min = Sys.Date() - 365, max = Sys.Date()))
+  }
+  
+  list(
+    min = min(h_data$Date, na.rm = TRUE),
+    max = max(h_data$Date, na.rm = TRUE)
+  )
+}
+
+# ============================================================================
 # CSS STYLES
 # ============================================================================
 
@@ -1963,6 +2466,23 @@ app_css <- HTML("
   .nav-tabs > li.active > a { background: #006F71 !important; color: white !important; }
   .nav-pills > li > a { color: #006F71; }
   .nav-pills > li.active > a { background: #006F71 !important; color: white !important; }
+  
+  /* Advanced Heat Maps Styles */
+  .adv-heatmap-container { margin-top: 15px; }
+  .adv-heatmap-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+  .adv-heatmap-table th { background: #006F71; color: white; padding: 8px; text-align: center; font-weight: 600; }
+  .adv-heatmap-table td { padding: 6px; text-align: center; border-bottom: 1px solid #eee; }
+  .adv-heatmap-table tr:nth-child(even) { background: #f9f9f9; }
+  .adv-heatmap-table .row-label { text-align: left; font-weight: 600; background: #f5f5f5; }
+  
+  /* Trend Chart Styles */
+  .trend-controls { background: #f8f9fa; padding: 12px; border-radius: 8px; margin-bottom: 15px; }
+  .trend-controls .checkbox-inline { margin-right: 15px; }
+  .trend-controls label { font-weight: 500; }
+  
+  /* Toggle switch for advanced heatmaps */
+  .shiny-input-container.checkbox { margin-bottom: 10px; }
+  .shiny-input-container.checkbox label { font-weight: 600; color: #006F71; }
 ")
 
 # ============================================================================
@@ -2394,6 +2914,99 @@ server <- function(input, output, session) {
                      column(6, plotOutput(paste0("pct_sec_", hitter_id), height = "320px")),
                      column(6, plotOutput(paste0("pct_d1_", hitter_id), height = "320px")))))),
       
+      # ============================================================================
+      # ADVANCED HEAT MAPS SECTION
+      # ============================================================================
+      fluidRow(
+        column(12,
+               div(class = "detail-section", 
+                   div(class = "section-header section-header-orange", "Advanced Heat Maps"),
+                   
+                   # Toggle to show/hide advanced heat maps
+                   checkboxInput(paste0("show_adv_heatmaps_", hitter_id), "Show Advanced Heat Maps", value = FALSE),
+                   
+                   conditionalPanel(
+                     condition = paste0("input.show_adv_heatmaps_", hitter_id, " == true"),
+                     
+                     # Tab panel for the 4 sheets
+                     tabsetPanel(id = paste0("adv_heatmap_tabs_", hitter_id), type = "pills",
+                       
+                       # Sheet 1: By Pitch Type vs RHP
+                       tabPanel("Pitch Type vs RHP",
+                         div(style = "margin-top: 15px;",
+                             div(style = "font-weight: bold; margin-bottom: 10px; text-align: center;", "Performance by Pitch Type vs RHP"),
+                             uiOutput(paste0("adv_hm_pitch_rhp_", hitter_id))
+                         )
+                       ),
+                       
+                       # Sheet 2: By Pitch Type vs LHP
+                       tabPanel("Pitch Type vs LHP",
+                         div(style = "margin-top: 15px;",
+                             div(style = "font-weight: bold; margin-bottom: 10px; text-align: center;", "Performance by Pitch Type vs LHP"),
+                             uiOutput(paste0("adv_hm_pitch_lhp_", hitter_id))
+                         )
+                       ),
+                       
+                       # Sheet 3: By Count Type vs RHP
+                       tabPanel("Count Type vs RHP",
+                         div(style = "margin-top: 15px;",
+                             div(style = "font-weight: bold; margin-bottom: 10px; text-align: center;", "Performance by Count vs RHP"),
+                             uiOutput(paste0("adv_hm_count_rhp_", hitter_id))
+                         )
+                       ),
+                       
+                       # Sheet 4: By Count Type vs LHP
+                       tabPanel("Count Type vs LHP",
+                         div(style = "margin-top: 15px;",
+                             div(style = "font-weight: bold; margin-bottom: 10px; text-align: center;", "Performance by Count vs LHP"),
+                             uiOutput(paste0("adv_hm_count_lhp_", hitter_id))
+                         )
+                       )
+                     )
+                   )
+               )
+        )
+      ),
+      
+      # ============================================================================
+      # TREND CHARTS SECTION
+      # ============================================================================
+      fluidRow(
+        column(12,
+               div(class = "detail-section", 
+                   div(class = "section-header section-header-blue", "Performance Trends"),
+                   
+                   # Controls for trend chart
+                   fluidRow(
+                     column(3,
+                       dateRangeInput(paste0("trend_dates_", hitter_id), "Date Range:",
+                                      start = Sys.Date() - 180, end = Sys.Date(),
+                                      min = "2024-01-01", max = Sys.Date())
+                     ),
+                     column(6,
+                       checkboxGroupInput(paste0("trend_stats_", hitter_id), "Select Stats:",
+                                          choices = c("Swing%" = "swing_pct", "wOBA" = "woba", 
+                                                     "Chase%" = "chase_pct", "Whiff%" = "whiff_pct",
+                                                     "IZ Whiff%" = "iz_whiff_pct", "IZ Damage%" = "iz_damage_pct"),
+                                          selected = c("swing_pct", "woba", "whiff_pct", "chase_pct"),
+                                          inline = TRUE)
+                     ),
+                     column(3,
+                       div(style = "margin-top: 25px;",
+                         actionButton(paste0("select_all_stats_", hitter_id), "Select All", 
+                                     class = "btn btn-sm", style = "margin-right: 5px;"),
+                         actionButton(paste0("deselect_all_stats_", hitter_id), "Deselect All", 
+                                     class = "btn btn-sm")
+                       )
+                     )
+                   ),
+                   
+                   # Trend chart output
+                   plotOutput(paste0("trend_chart_", hitter_id), height = "350px")
+               )
+        )
+      ),
+      
       div(class = "detail-section", div(class = "section-header", "Scouting Notes"),
           fluidRow(
             column(4, 
@@ -2482,6 +3095,283 @@ server <- function(input, output, session) {
     output[[paste0("pct_d1_", hitter_id)]] <- renderPlot({
       create_sec_percentile_chart(h_raw, d1_pool_data, h_name, "Overall D1")
     }, bg = "transparent")
+    
+    # ============================================================================
+    # ADVANCED HEAT MAPS RENDERING
+    # ============================================================================
+    
+    # Helper function to create advanced heat map stats table
+    create_adv_heatmap_table <- function(stats_list, split_col_name, h_raw, pitcher_hand) {
+      stat_cols <- c("Pitch Freq", "Swing%", "wOBA", "Damage (95+)", "Chase%", "Whiff%", "IZ Whiff%", "IZ Damage%")
+      
+      # Create header row
+      header_row <- tags$tr(
+        tags$th(style = "padding: 8px; background: #006F71; color: white; text-align: left;", split_col_name),
+        lapply(stat_cols, function(col) {
+          tags$th(style = "padding: 8px; background: #006F71; color: white; text-align: center; font-size: 11px;", col)
+        })
+      )
+      
+      # Create data rows
+      data_rows <- lapply(stats_list, function(row_data) {
+        row_name <- if (!is.null(row_data$pitch_type)) row_data$pitch_type else row_data$count_type
+        
+        # Format stat values
+        format_stat <- function(val, is_pct = TRUE, is_woba = FALSE) {
+          if (is.na(val) || is.null(val)) return("-")
+          if (is_woba) return(sprintf("%.3f", val))
+          if (is_pct) return(sprintf("%.1f%%", val))
+          return(sprintf("%.0f", val))
+        }
+        
+        # Color coding helper
+        get_cell_style <- function(val, benchmark, higher_better = TRUE) {
+          if (is.na(val)) return("background: #f5f5f5; color: #666;")
+          if (benchmark == 0) {
+            bg_col <- if (higher_better) {
+              if (val > 0.5) "#C8E6C9" else if (val > 0) "#DCEDC8" else if (val >= -0.5) "#FFF9C4" else "#FFCDD2"
+            } else {
+              if (val < -0.5) "#C8E6C9" else if (val < 0) "#DCEDC8" else if (val <= 0.5) "#FFF9C4" else "#FFCDD2"
+            }
+          } else {
+            pct_diff <- if (higher_better) (val - benchmark) / abs(benchmark) * 100 else (benchmark - val) / abs(benchmark) * 100
+            bg_col <- if (pct_diff > 10) "#C8E6C9" else if (pct_diff > 0) "#DCEDC8" else if (pct_diff >= -10) "#FFF9C4" else "#FFCDD2"
+          }
+          paste0("background: ", bg_col, "; padding: 6px; text-align: center; font-size: 11px;")
+        }
+        
+        tags$tr(
+          tags$td(style = "padding: 8px; font-weight: bold; background: #f5f5f5;", row_name),
+          tags$td(style = "padding: 6px; text-align: center; font-size: 11px;", format_stat(row_data$pitch_freq, is_pct = FALSE)),
+          tags$td(style = get_cell_style(row_data$swing_pct, 48, TRUE), format_stat(row_data$swing_pct)),
+          tags$td(style = get_cell_style(row_data$woba, 0.320, TRUE), format_stat(row_data$woba, is_woba = TRUE)),
+          tags$td(style = get_cell_style(row_data$damage_pct, 35, TRUE), format_stat(row_data$damage_pct)),
+          tags$td(style = get_cell_style(row_data$chase_pct, 28, FALSE), format_stat(row_data$chase_pct)),
+          tags$td(style = get_cell_style(row_data$whiff_pct, 25, FALSE), format_stat(row_data$whiff_pct)),
+          tags$td(style = get_cell_style(row_data$iz_whiff_pct, 15, FALSE), format_stat(row_data$iz_whiff_pct)),
+          tags$td(style = get_cell_style(row_data$iz_damage_pct, 35, TRUE), format_stat(row_data$iz_damage_pct))
+        )
+      })
+      
+      # Combine table
+      tags$table(class = "splits-table", style = "width: 100%; border-collapse: collapse;",
+        tags$thead(header_row),
+        tags$tbody(data_rows)
+      )
+    }
+    
+    # Advanced Heat Map: Pitch Type vs RHP
+    output[[paste0("adv_hm_pitch_rhp_", hitter_id)]] <- renderUI({
+      stats <- get_advanced_heatmap_stats(h_name, "Right", "pitch_type")
+      if (length(stats) == 0) return(div("No data available"))
+      
+      # Create table with heat maps
+      div(
+        create_adv_heatmap_table(stats, "Pitch Type", h_raw, "Right"),
+        div(style = "margin-top: 15px;",
+            div(style = "font-weight: bold; margin-bottom: 8px;", "Heat Map Zones by Pitch Type"),
+            fluidRow(
+              lapply(c("4S", "2S/Si", "SL/SW", "CB", "CH/Spl"), function(pt) {
+                pt_data <- h_raw %>% filter(PitcherThrows == "Right") %>%
+                  mutate(DetailedPitchType = classify_detailed_pitch(TaggedPitchType)) %>%
+                  filter(DetailedPitchType == pt)
+                pt_stats <- stats[sapply(stats, function(x) x$pitch_type == pt)]
+                whiff_pct <- if (length(pt_stats) > 0) pt_stats[[1]]$whiff_pct else NA
+                n_pitches <- if (length(pt_stats) > 0) pt_stats[[1]]$n else 0
+                
+                column(2, 
+                       plotOutput(paste0("adv_hm_pt_rhp_", gsub("/", "_", pt), "_", hitter_id), height = "90px"),
+                       div(style = "text-align: center; font-size: 10px; margin-top: -5px;", pt)
+                )
+              }),
+              column(2, div())  # Empty column for alignment
+            )
+        )
+      )
+    })
+    
+    # Advanced Heat Map: Pitch Type vs LHP
+    output[[paste0("adv_hm_pitch_lhp_", hitter_id)]] <- renderUI({
+      stats <- get_advanced_heatmap_stats(h_name, "Left", "pitch_type")
+      if (length(stats) == 0) return(div("No data available"))
+      
+      div(
+        create_adv_heatmap_table(stats, "Pitch Type", h_raw, "Left"),
+        div(style = "margin-top: 15px;",
+            div(style = "font-weight: bold; margin-bottom: 8px;", "Heat Map Zones by Pitch Type"),
+            fluidRow(
+              lapply(c("4S", "2S/Si", "SL/SW", "CB", "CH/Spl"), function(pt) {
+                column(2, 
+                       plotOutput(paste0("adv_hm_pt_lhp_", gsub("/", "_", pt), "_", hitter_id), height = "90px"),
+                       div(style = "text-align: center; font-size: 10px; margin-top: -5px;", pt)
+                )
+              }),
+              column(2, div())
+            )
+        )
+      )
+    })
+    
+    # Advanced Heat Map: Count Type vs RHP
+    output[[paste0("adv_hm_count_rhp_", hitter_id)]] <- renderUI({
+      stats <- get_advanced_heatmap_stats(h_name, "Right", "count_type")
+      if (length(stats) == 0) return(div("No data available"))
+      
+      div(
+        create_adv_heatmap_table(stats, "Count", h_raw, "Right"),
+        div(style = "margin-top: 15px;",
+            div(style = "font-weight: bold; margin-bottom: 8px;", "Heat Map Zones by Count"),
+            fluidRow(
+              lapply(c("1P", "2K", "Ahead", "Behind", "Last 15"), function(ct) {
+                column(2, 
+                       plotOutput(paste0("adv_hm_ct_rhp_", gsub(" ", "_", ct), "_", hitter_id), height = "90px"),
+                       div(style = "text-align: center; font-size: 10px; margin-top: -5px;", ct)
+                )
+              }),
+              column(2, div())
+            )
+        )
+      )
+    })
+    
+    # Advanced Heat Map: Count Type vs LHP
+    output[[paste0("adv_hm_count_lhp_", hitter_id)]] <- renderUI({
+      stats <- get_advanced_heatmap_stats(h_name, "Left", "count_type")
+      if (length(stats) == 0) return(div("No data available"))
+      
+      div(
+        create_adv_heatmap_table(stats, "Count", h_raw, "Left"),
+        div(style = "margin-top: 15px;",
+            div(style = "font-weight: bold; margin-bottom: 8px;", "Heat Map Zones by Count"),
+            fluidRow(
+              lapply(c("1P", "2K", "Ahead", "Behind", "Last 15"), function(ct) {
+                column(2, 
+                       plotOutput(paste0("adv_hm_ct_lhp_", gsub(" ", "_", ct), "_", hitter_id), height = "90px"),
+                       div(style = "text-align: center; font-size: 10px; margin-top: -5px;", ct)
+                )
+              }),
+              column(2, div())
+            )
+        )
+      )
+    })
+    
+    # Render individual heat map plots for pitch types
+    for (pt in c("4S", "2S_Si", "SL_SW", "CB", "CH_Spl")) {
+      local({
+        pitch_type <- gsub("_", "/", pt)
+        pt_safe <- pt
+        
+        # vs RHP
+        output[[paste0("adv_hm_pt_rhp_", pt_safe, "_", hitter_id)]] <- renderPlot({
+          pt_data <- h_raw %>% 
+            filter(PitcherThrows == "Right") %>%
+            mutate(DetailedPitchType = classify_detailed_pitch(TaggedPitchType)) %>%
+            filter(DetailedPitchType == pitch_type)
+          create_heatmap(pt_data, "", "whiff", c("white", "#FFCCCC", "#FF6666", "#CC0000"), "All", "All")
+        }, bg = "transparent")
+        
+        # vs LHP
+        output[[paste0("adv_hm_pt_lhp_", pt_safe, "_", hitter_id)]] <- renderPlot({
+          pt_data <- h_raw %>% 
+            filter(PitcherThrows == "Left") %>%
+            mutate(DetailedPitchType = classify_detailed_pitch(TaggedPitchType)) %>%
+            filter(DetailedPitchType == pitch_type)
+          create_heatmap(pt_data, "", "whiff", c("white", "#FFCCCC", "#FF6666", "#CC0000"), "All", "All")
+        }, bg = "transparent")
+      })
+    }
+    
+    # Render individual heat map plots for count types
+    for (ct in c("1P", "2K", "Ahead", "Behind", "Last_15")) {
+      local({
+        count_type <- gsub("_", " ", ct)
+        ct_safe <- ct
+        
+        # vs RHP
+        output[[paste0("adv_hm_ct_rhp_", ct_safe, "_", hitter_id)]] <- renderPlot({
+          if (ct_safe == "Last_15") {
+            last15_dates <- get_last_n_games(tm_data, h_name, 15)
+            ct_data <- h_raw %>% filter(PitcherThrows == "Right", Date %in% last15_dates)
+          } else {
+            ct_data <- h_raw %>% 
+              filter(PitcherThrows == "Right") %>%
+              mutate(
+                CountType = case_when(
+                  Balls == 0 & Strikes == 0 ~ "1P",
+                  Strikes == 2 ~ "2K",
+                  Strikes > Balls ~ "Ahead",
+                  Balls > Strikes ~ "Behind",
+                  TRUE ~ "Even"
+                )
+              ) %>%
+              filter(CountType == count_type)
+          }
+          create_heatmap(ct_data, "", "whiff", c("white", "#FFCCCC", "#FF6666", "#CC0000"), "All", "All")
+        }, bg = "transparent")
+        
+        # vs LHP
+        output[[paste0("adv_hm_ct_lhp_", ct_safe, "_", hitter_id)]] <- renderPlot({
+          if (ct_safe == "Last_15") {
+            last15_dates <- get_last_n_games(tm_data, h_name, 15)
+            ct_data <- h_raw %>% filter(PitcherThrows == "Left", Date %in% last15_dates)
+          } else {
+            ct_data <- h_raw %>% 
+              filter(PitcherThrows == "Left") %>%
+              mutate(
+                CountType = case_when(
+                  Balls == 0 & Strikes == 0 ~ "1P",
+                  Strikes == 2 ~ "2K",
+                  Strikes > Balls ~ "Ahead",
+                  Balls > Strikes ~ "Behind",
+                  TRUE ~ "Even"
+                )
+              ) %>%
+              filter(CountType == count_type)
+          }
+          create_heatmap(ct_data, "", "whiff", c("white", "#FFCCCC", "#FF6666", "#CC0000"), "All", "All")
+        }, bg = "transparent")
+      })
+    }
+    
+    # ============================================================================
+    # TREND CHART RENDERING
+    # ============================================================================
+    
+    # Update date range based on batter's data
+    date_range <- get_batter_date_range(h_name, tm_data)
+    updateDateRangeInput(session, paste0("trend_dates_", hitter_id),
+                         start = max(date_range$min, Sys.Date() - 180),
+                         end = date_range$max,
+                         min = date_range$min,
+                         max = date_range$max)
+    
+    # Trend chart output
+    output[[paste0("trend_chart_", hitter_id)]] <- renderPlot({
+      selected_stats <- input[[paste0("trend_stats_", hitter_id)]]
+      date_range <- input[[paste0("trend_dates_", hitter_id)]]
+      
+      if (is.null(selected_stats) || length(selected_stats) == 0) {
+        return(ggplot() + theme_void() + 
+                 annotate("text", x = 0.5, y = 0.5, label = "Select at least one stat to display", 
+                         size = 4, color = "gray50"))
+      }
+      
+      start_date <- if (!is.null(date_range[1])) date_range[1] else NULL
+      end_date <- if (!is.null(date_range[2])) date_range[2] else NULL
+      
+      create_trend_chart(h_name, tm_data, selected_stats, start_date, end_date, rolling_games = 5)
+    }, bg = "transparent")
+    
+    # Select/Deselect all stats buttons
+    observeEvent(input[[paste0("select_all_stats_", hitter_id)]], {
+      updateCheckboxGroupInput(session, paste0("trend_stats_", hitter_id),
+                              selected = c("swing_pct", "woba", "chase_pct", "whiff_pct", "iz_whiff_pct", "iz_damage_pct"))
+    }, ignoreInit = TRUE)
+    
+    observeEvent(input[[paste0("deselect_all_stats_", hitter_id)]], {
+      updateCheckboxGroupInput(session, paste0("trend_stats_", hitter_id), selected = character(0))
+    }, ignoreInit = TRUE)
   })
   
   # Optimized note saving - only triggers on save button click
