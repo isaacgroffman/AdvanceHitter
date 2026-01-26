@@ -1,5 +1,8 @@
 # ============================================================================
 # HITTER SCOUTING CARDS APP - Streamlined Version
+# With MAC (Matchup Analysis using Clustering) Methodology
+# Based on: "Using Euclidean Distance and Clustering to quantify matchups"
+# by Chap Cunningham and Zack Aisen (Saber Seminar 2025)
 # ============================================================================
 
 library(shiny)
@@ -14,6 +17,8 @@ library(arrow)
 library(httr)
 library(xgboost)  # For xRV predictive model
 
+# Suppress jsonlite warnings about named vectors (cosmetic, doesn't affect functionality)
+options(shiny.sanitize.errors = FALSE)
 
 PASSWORD <- Sys.getenv("password")
 
@@ -394,6 +399,25 @@ batter_pitch_performance <- tm_data %>%
 all_pitchers <- sort(unique(tm_data$Pitcher))
 
 # ============================================================================
+# PRE-COMPUTE STANDARDIZED BATTER DATA FOR MAC (MEMORY OPTIMIZED)
+# ============================================================================
+# Pre-compute z-scores and safe values to avoid recalculating during matchup queries
+
+batter_pitch_performance <- batter_pitch_performance %>%
+  mutate(
+    # Pre-compute safe z-scores for MAC distance calculation (coalesce NA to 0)
+    RelSpeed_z_safe = coalesce(RelSpeed_z, 0),
+    IVB_z_safe = coalesce(IVB_z, 0),
+    HB_z_safe = coalesce(HB_z, 0),
+    SpinRate_z_safe = coalesce(SpinRate_z, 0),
+    RelHeight_z_safe = coalesce(RelHeight_z, 0),
+    RelSide_z_safe = coalesce(RelSide_z, 0)
+  )
+
+# Force garbage collection after adding columns
+gc(verbose = FALSE)
+
+# ============================================================================
 # PRE-BIN BATTER PERFORMANCE AGAINST PITCH PROFILES AT STARTUP
 # ============================================================================
 # This pre-computation reduces model load times by caching aggregated stats
@@ -563,15 +587,56 @@ cat("Final memory usage:", round(sum(gc()[,2]), 1), "MB\n")
 cat("Loaded", nrow(tm_data), "pitch records for", length(all_hitters), "hitters and", length(all_pitchers), "pitchers\n")
 
 # ============================================================================
-# MAC-STYLE MATCHUP CALCULATION FUNCTION
+# MAC-STYLE MATCHUP CALCULATION FUNCTION (Euclidean Distance with 0.6 threshold)
+# Based on: "Using Euclidean Distance and Clustering to quantify batter vs. pitcher matchups"
+# by Chap Cunningham and Zack Aisen (Saber Seminar 2025)
 # ============================================================================
 
-calculate_mac_matchup <- function(p_name, h_name, distance_threshold = 1.0) {
+# MAC Distance threshold - 0.6 is the "sweet spot" per the article
+MAC_DISTANCE_THRESHOLD <- 0.6
+
+# Vectorized Euclidean distance calculation for efficiency
+calculate_euclidean_distance_vectorized <- function(batter_df, target) {
+  sqrt(
+    (batter_df$RelSpeed_z_safe - target$RelSpeed_z)^2 +
+    (batter_df$IVB_z_safe - target$IVB_z)^2 +
+    (batter_df$HB_z_safe - target$HB_z)^2 +
+    (batter_df$SpinRate_z_safe - target$SpinRate_z)^2 +
+    (batter_df$RelHeight_z_safe - target$RelHeight_z)^2 +
+    (batter_df$RelSide_z_safe - target$RelSide_z)^2
+  )
+}
+
+# Convert RV/100 to 0-100 MAC score
+# 0 = Strong Hitter Advantage, 50 = Neutral, 100 = Strong Pitcher Advantage
+rv100_to_mac_score <- function(rv100, n_similar) {
+  if (is.na(rv100) || n_similar < 5) return(50)
+  
+  # Apply confidence adjustment based on sample size
+  # More samples = more confident in the score
+  confidence <- min(1, n_similar / 100)
+  
+  # Scale: RV/100 of +3 = 0 (strong hitter), -3 = 100 (strong pitcher)
+  # Center at 50, scale by 16.67 per run value
+  raw_score <- 50 - (rv100 * 16.67)
+  
+  # Apply confidence - pull toward 50 if low sample
+  adjusted_score <- 50 + (raw_score - 50) * confidence
+  
+  # Clamp to 0-100
+  round(max(0, min(100, adjusted_score)))
+}
+
+calculate_mac_matchup <- function(p_name, h_name, distance_threshold = MAC_DISTANCE_THRESHOLD) {
   # Get pitcher's arsenal
   p_arsenal <- pitcher_arsenal %>% filter(Pitcher == p_name)
   
   if (nrow(p_arsenal) == 0) {
-    return(list(score = 50, rv100 = 0, n_similar = 0, by_pitch = NULL))
+    return(list(
+      score = 50, rv100 = 0, n_similar = 0, by_pitch = NULL,
+      whiff_pct = NA, chase_pct = NA, woba = NA, damage_pct = NA,
+      confidence = "Low"
+    ))
   }
   
   p_hand <- p_arsenal$PitcherThrows[1]
@@ -581,60 +646,56 @@ calculate_mac_matchup <- function(p_name, h_name, distance_threshold = 1.0) {
     filter(Batter == h_name, PitcherThrows == p_hand)
   
   if (nrow(batter_pitches) < 20) {
-    return(list(score = 50, rv100 = 0, n_similar = 0, by_pitch = NULL))
+    return(list(
+      score = 50, rv100 = 0, n_similar = 0, by_pitch = NULL,
+      whiff_pct = NA, chase_pct = NA, woba = NA, damage_pct = NA,
+      confidence = "Low"
+    ))
   }
+  
+  # Use pre-computed safe z-scores (no need to recalculate - already done at startup)
+  batter_pitches_safe <- batter_pitches
   
   # For each pitch type in pitcher's arsenal, find similar pitches batter has faced
   results_by_pitch <- list()
+  all_similar_pitches <- data.frame()
   total_similar <- 0
   
   for (i in 1:nrow(p_arsenal)) {
     pitch_type <- p_arsenal$PitchFamily[i]
     usage <- p_arsenal$usage_pct[i]
     
-    # Target pitch profile (standardized)
+    # Target pitch profile (standardized) - from MAC scanning features
     target <- list(
-      RelSpeed_z = (p_arsenal$RelSpeed[i] - feature_means$RelSpeed) / feature_sds$RelSpeed,
-      IVB_z = (p_arsenal$InducedVertBreak[i] - feature_means$InducedVertBreak) / feature_sds$InducedVertBreak,
-      HB_z = (p_arsenal$HorzBreak[i] - feature_means$HorzBreak) / feature_sds$HorzBreak,
-      SpinRate_z = (p_arsenal$SpinRate[i] - feature_means$SpinRate) / feature_sds$SpinRate,
-      RelHeight_z = (p_arsenal$RelHeight[i] - feature_means$RelHeight) / feature_sds$RelHeight,
-      RelSide_z = (p_arsenal$RelSide[i] - feature_means$RelSide) / feature_sds$RelSide
+      RelSpeed_z = coalesce((p_arsenal$RelSpeed[i] - feature_means$RelSpeed) / feature_sds$RelSpeed, 0),
+      IVB_z = coalesce((p_arsenal$InducedVertBreak[i] - feature_means$InducedVertBreak) / feature_sds$InducedVertBreak, 0),
+      HB_z = coalesce((p_arsenal$HorzBreak[i] - feature_means$HorzBreak) / feature_sds$HorzBreak, 0),
+      SpinRate_z = coalesce((p_arsenal$SpinRate[i] - feature_means$SpinRate) / feature_sds$SpinRate, 0),
+      RelHeight_z = coalesce((p_arsenal$RelHeight[i] - feature_means$RelHeight) / feature_sds$RelHeight, 0),
+      RelSide_z = coalesce((p_arsenal$RelSide[i] - feature_means$RelSide) / feature_sds$RelSide, 0)
     )
     
-    # Handle NA in target
-    target <- lapply(target, function(x) if(is.na(x) || is.nan(x)) 0 else x)
+    # Vectorized distance calculation for efficiency
+    distances <- calculate_euclidean_distance_vectorized(batter_pitches_safe, target)
     
-    # Calculate distance for each pitch batter has seen
-    batter_pitches_calc <- batter_pitches %>%
-      mutate(
-        RelSpeed_z_safe = ifelse(is.na(RelSpeed_z), 0, RelSpeed_z),
-        IVB_z_safe = ifelse(is.na(IVB_z), 0, IVB_z),
-        HB_z_safe = ifelse(is.na(HB_z), 0, HB_z),
-        SpinRate_z_safe = ifelse(is.na(SpinRate_z), 0, SpinRate_z),
-        RelHeight_z_safe = ifelse(is.na(RelHeight_z), 0, RelHeight_z),
-        RelSide_z_safe = ifelse(is.na(RelSide_z), 0, RelSide_z),
-        distance = sqrt(
-          (RelSpeed_z_safe - target$RelSpeed_z)^2 +
-            (IVB_z_safe - target$IVB_z)^2 +
-            (HB_z_safe - target$HB_z)^2 +
-            (SpinRate_z_safe - target$SpinRate_z)^2 +
-            (RelHeight_z_safe - target$RelHeight_z)^2 +
-            (RelSide_z_safe - target$RelSide_z)^2
-        )
-      )
-    
-    # Filter to similar pitches
-    similar_pitches <- batter_pitches_calc %>%
-      filter(!is.na(distance), distance <= distance_threshold)
+    # Filter to similar pitches using MAC threshold (0.6)
+    similar_mask <- !is.na(distances) & distances <= distance_threshold
+    similar_pitches <- batter_pitches_safe[similar_mask, ]
+    similar_pitches$distance <- distances[similar_mask]
+    similar_pitches$pitcher_pitch_type <- pitch_type
     
     n_similar_pitch <- nrow(similar_pitches)
     
     if (n_similar_pitch >= 5) {
+      # Calculate metrics on similar pitches
       rv100_similar <- 100 * mean(similar_pitches$hitter_rv, na.rm = TRUE)
+      whiff_pct <- 100 * mean(similar_pitches$WhiffIndicator, na.rm = TRUE)
+      chase_pct <- 100 * mean(similar_pitches$chase[similar_pitches$out_of_zone == 1], na.rm = TRUE)
+      woba <- mean(similar_pitches$woba, na.rm = TRUE)
+      damage_pct <- 100 * mean(similar_pitches$ExitSpeed >= 95, na.rm = TRUE)
       
-      # Apply shrinkage based on sample size
-      k <- 60
+      # Apply shrinkage based on sample size (Bayesian approach)
+      k <- 50  # Shrinkage factor
       shrinkage <- n_similar_pitch / (n_similar_pitch + k)
       rv100_shrunk <- shrinkage * rv100_similar + (1 - shrinkage) * 0
       
@@ -642,20 +703,29 @@ calculate_mac_matchup <- function(p_name, h_name, distance_threshold = 1.0) {
         n = n_similar_pitch,
         rv100 = rv100_shrunk,
         rv100_raw = rv100_similar,
-        usage = usage
+        usage = usage,
+        whiff_pct = whiff_pct,
+        chase_pct = if(is.nan(chase_pct)) NA else chase_pct,
+        woba = woba,
+        damage_pct = damage_pct
       )
       total_similar <- total_similar + n_similar_pitch
+      all_similar_pitches <- rbind(all_similar_pitches, similar_pitches)
     } else {
       results_by_pitch[[pitch_type]] <- list(
         n = n_similar_pitch,
         rv100 = 0,
         rv100_raw = NA,
-        usage = usage
+        usage = usage,
+        whiff_pct = NA,
+        chase_pct = NA,
+        woba = NA,
+        damage_pct = NA
       )
     }
   }
   
-  # Calculate weighted RV/100
+  # Calculate usage-weighted RV/100 (MAC methodology)
   weighted_rv100 <- 0
   total_usage_weight <- 0
   
@@ -664,9 +734,9 @@ calculate_mac_matchup <- function(p_name, h_name, distance_threshold = 1.0) {
     usage <- pitch_data$usage
     
     if (pitch_data$n >= 5 && !is.na(pitch_data$rv100_raw)) {
-      usage_weight <- usage^1.5
-      weighted_rv100 <- weighted_rv100 + pitch_data$rv100 * usage_weight
-      total_usage_weight <- total_usage_weight + usage_weight
+      # Weight by usage percentage
+      weighted_rv100 <- weighted_rv100 + pitch_data$rv100 * usage
+      total_usage_weight <- total_usage_weight + usage
     }
   }
   
@@ -676,31 +746,38 @@ calculate_mac_matchup <- function(p_name, h_name, distance_threshold = 1.0) {
     weighted_rv100 <- 0
   }
   
-  # Convert RV/100 to 0-100 score
-  # SCORING: 0 = hitter advantage, 100 = pitcher advantage
-  rv_score_contribution <- -weighted_rv100 * 15
-  base_score <- 50 + rv_score_contribution
-  final_score <- round(max(15, min(85, base_score)))
+  # Calculate overall stats from all similar pitches
+  overall_whiff <- if(nrow(all_similar_pitches) > 0) 100 * mean(all_similar_pitches$WhiffIndicator, na.rm = TRUE) else NA
+  overall_chase <- if(nrow(all_similar_pitches) > 0) 100 * mean(all_similar_pitches$chase[all_similar_pitches$out_of_zone == 1], na.rm = TRUE) else NA
+  overall_woba <- if(nrow(all_similar_pitches) > 0) mean(all_similar_pitches$woba, na.rm = TRUE) else NA
+  overall_damage <- if(nrow(all_similar_pitches) > 0) 100 * mean(all_similar_pitches$ExitSpeed >= 95, na.rm = TRUE) else NA
   
-  if (abs(weighted_rv100) > 2) {
-    final_score <- round(max(5, min(95, 50 + rv_score_contribution)))
-  }
+  # Convert to MAC 0-100 score
+  final_score <- rv100_to_mac_score(weighted_rv100, total_similar)
+  
+  # Confidence level based on sample size
+  confidence <- if(total_similar < 30) "Low" else if(total_similar < 100) "Medium" else "High"
   
   list(
     score = final_score,
     rv100 = round(weighted_rv100, 2),
     n_similar = total_similar,
-    by_pitch = results_by_pitch
+    by_pitch = results_by_pitch,
+    whiff_pct = round(overall_whiff, 1),
+    chase_pct = if(is.nan(overall_chase)) NA else round(overall_chase, 1),
+    woba = round(overall_woba, 3),
+    damage_pct = round(overall_damage, 1),
+    confidence = confidence
   )
 }
 
-# Calculate pitch type specific matchup (FB, BB, OS)
-calculate_pitch_type_matchup <- function(p_name, h_name, pitch_family, distance_threshold = 1.0) {
+# Calculate pitch type specific matchup (FB, BB, OS) using MAC methodology
+calculate_pitch_type_matchup <- function(p_name, h_name, pitch_family, distance_threshold = MAC_DISTANCE_THRESHOLD) {
   # Get pitcher's arsenal for specific pitch type
   p_arsenal <- pitcher_arsenal %>% filter(Pitcher == p_name, PitchFamily == pitch_family)
   
   if (nrow(p_arsenal) == 0) {
-    return(list(score = 50, rv100 = 0, n_similar = 0))
+    return(list(score = 50, rv100 = 0, n_similar = 0, whiff_pct = NA, chase_pct = NA, woba = NA))
   }
   
   p_hand <- p_arsenal$PitcherThrows[1]
@@ -710,59 +787,56 @@ calculate_pitch_type_matchup <- function(p_name, h_name, pitch_family, distance_
     filter(Batter == h_name, PitcherThrows == p_hand)
   
   if (nrow(batter_pitches) < 20) {
-    return(list(score = 50, rv100 = 0, n_similar = 0))
+    return(list(score = 50, rv100 = 0, n_similar = 0, whiff_pct = NA, chase_pct = NA, woba = NA))
   }
   
-  # Target pitch profile (standardized)
+  # Target pitch profile (standardized) - MAC scanning features
   target <- list(
-    RelSpeed_z = (p_arsenal$RelSpeed[1] - feature_means$RelSpeed) / feature_sds$RelSpeed,
-    IVB_z = (p_arsenal$InducedVertBreak[1] - feature_means$InducedVertBreak) / feature_sds$InducedVertBreak,
-    HB_z = (p_arsenal$HorzBreak[1] - feature_means$HorzBreak) / feature_sds$HorzBreak,
-    SpinRate_z = (p_arsenal$SpinRate[1] - feature_means$SpinRate) / feature_sds$SpinRate,
-    RelHeight_z = (p_arsenal$RelHeight[1] - feature_means$RelHeight) / feature_sds$RelHeight,
-    RelSide_z = (p_arsenal$RelSide[1] - feature_means$RelSide) / feature_sds$RelSide
+    RelSpeed_z = coalesce((p_arsenal$RelSpeed[1] - feature_means$RelSpeed) / feature_sds$RelSpeed, 0),
+    IVB_z = coalesce((p_arsenal$InducedVertBreak[1] - feature_means$InducedVertBreak) / feature_sds$InducedVertBreak, 0),
+    HB_z = coalesce((p_arsenal$HorzBreak[1] - feature_means$HorzBreak) / feature_sds$HorzBreak, 0),
+    SpinRate_z = coalesce((p_arsenal$SpinRate[1] - feature_means$SpinRate) / feature_sds$SpinRate, 0),
+    RelHeight_z = coalesce((p_arsenal$RelHeight[1] - feature_means$RelHeight) / feature_sds$RelHeight, 0),
+    RelSide_z = coalesce((p_arsenal$RelSide[1] - feature_means$RelSide) / feature_sds$RelSide, 0)
   )
   
-  target <- lapply(target, function(x) if(is.na(x) || is.nan(x)) 0 else x)
+  # Use pre-computed safe z-scores (already done at startup)
+  batter_pitches_safe <- batter_pitches
   
-  # Calculate distance for each pitch batter has seen
-  batter_pitches_calc <- batter_pitches %>%
-    mutate(
-      RelSpeed_z_safe = ifelse(is.na(RelSpeed_z), 0, RelSpeed_z),
-      IVB_z_safe = ifelse(is.na(IVB_z), 0, IVB_z),
-      HB_z_safe = ifelse(is.na(HB_z), 0, HB_z),
-      SpinRate_z_safe = ifelse(is.na(SpinRate_z), 0, SpinRate_z),
-      RelHeight_z_safe = ifelse(is.na(RelHeight_z), 0, RelHeight_z),
-      RelSide_z_safe = ifelse(is.na(RelSide_z), 0, RelSide_z),
-      distance = sqrt(
-        (RelSpeed_z_safe - target$RelSpeed_z)^2 +
-          (IVB_z_safe - target$IVB_z)^2 +
-          (HB_z_safe - target$HB_z)^2 +
-          (SpinRate_z_safe - target$SpinRate_z)^2 +
-          (RelHeight_z_safe - target$RelHeight_z)^2 +
-          (RelSide_z_safe - target$RelSide_z)^2
-      )
-    )
+  # Vectorized distance calculation
+  distances <- calculate_euclidean_distance_vectorized(batter_pitches_safe, target)
   
-  similar_pitches <- batter_pitches_calc %>%
-    filter(!is.na(distance), distance <= distance_threshold)
+  # Filter using MAC threshold (0.6)
+  similar_mask <- !is.na(distances) & distances <= distance_threshold
+  similar_pitches <- batter_pitches_safe[similar_mask, ]
   
   n_similar <- nrow(similar_pitches)
   
   if (n_similar >= 5) {
     rv100_similar <- 100 * mean(similar_pitches$hitter_rv, na.rm = TRUE)
-    k <- 60
+    whiff_pct <- 100 * mean(similar_pitches$WhiffIndicator, na.rm = TRUE)
+    chase_pct <- 100 * mean(similar_pitches$chase[similar_pitches$out_of_zone == 1], na.rm = TRUE)
+    woba <- mean(similar_pitches$woba, na.rm = TRUE)
+    
+    # Shrinkage
+    k <- 50
     shrinkage <- n_similar / (n_similar + k)
     rv100_shrunk <- shrinkage * rv100_similar + (1 - shrinkage) * 0
     
-    rv_score_contribution <- -rv100_shrunk * 15
-    base_score <- 50 + rv_score_contribution
-    final_score <- round(max(15, min(85, base_score)))
+    # Convert to MAC score
+    final_score <- rv100_to_mac_score(rv100_shrunk, n_similar)
     
-    return(list(score = final_score, rv100 = round(rv100_shrunk, 2), n_similar = n_similar))
+    return(list(
+      score = final_score, 
+      rv100 = round(rv100_shrunk, 2), 
+      n_similar = n_similar,
+      whiff_pct = round(whiff_pct, 1),
+      chase_pct = if(is.nan(chase_pct)) NA else round(chase_pct, 1),
+      woba = round(woba, 3)
+    ))
   }
   
-  list(score = 50, rv100 = 0, n_similar = n_similar)
+  list(score = 50, rv100 = 0, n_similar = n_similar, whiff_pct = NA, chase_pct = NA, woba = NA)
 }
 
 # Helper function to get score color
@@ -1994,25 +2068,43 @@ create_trend_chart <- function(batter_name, tm_data, selected_stats = c("swing_p
       iz_damage_pct = ifelse(n_bip > 0, 100 * n_damage / n_bip, NA)
     )
   
-  # Calculate rolling averages
+  # Calculate rolling averages - handles edge cases properly
   calc_rolling_avg <- function(values, window = rolling_games) {
     n <- length(values)
-    result <- rep(NA, n)
-    for (i in window:n) {
-      window_vals <- values[(i - window + 1):i]
-      result[i] <- mean(window_vals, na.rm = TRUE)
+    if (n == 0) return(numeric(0))
+    if (n < window) {
+      # If fewer values than window, use expanding window
+      result <- rep(NA_real_, n)
+      for (i in seq_len(n)) {
+        result[i] <- mean(values[1:i], na.rm = TRUE)
+      }
+      return(result)
+    }
+    # Standard rolling average
+    result <- rep(NA_real_, n)
+    for (i in seq_len(n)) {
+      start_idx <- max(1, i - window + 1)
+      result[i] <- mean(values[start_idx:i], na.rm = TRUE)
     }
     result
   }
   
+  # Handle case where daily_stats might have 0 rows
+  if (nrow(daily_stats) == 0) {
+    return(ggplot() + theme_void() + 
+             annotate("text", x = 0.5, y = 0.5, label = "No data for selected period", size = 4, color = "gray50"))
+  }
+  
+  # Apply rolling averages safely
   daily_stats <- daily_stats %>%
+    ungroup() %>%
     mutate(
-      swing_pct_roll = calc_rolling_avg(swing_pct),
-      whiff_pct_roll = calc_rolling_avg(whiff_pct),
-      chase_pct_roll = calc_rolling_avg(chase_pct),
-      woba_roll = calc_rolling_avg(woba),
-      iz_whiff_pct_roll = calc_rolling_avg(iz_whiff_pct),
-      iz_damage_pct_roll = calc_rolling_avg(iz_damage_pct)
+      swing_pct_roll = calc_rolling_avg(swing_pct, rolling_games),
+      whiff_pct_roll = calc_rolling_avg(whiff_pct, rolling_games),
+      chase_pct_roll = calc_rolling_avg(chase_pct, rolling_games),
+      woba_roll = calc_rolling_avg(woba, rolling_games),
+      iz_whiff_pct_roll = calc_rolling_avg(iz_whiff_pct, rolling_games),
+      iz_damage_pct_roll = calc_rolling_avg(iz_damage_pct, rolling_games)
     )
   
   # Prepare data for plotting
@@ -2050,10 +2142,10 @@ create_trend_chart <- function(batter_name, tm_data, selected_stats = c("swing_p
   has_woba <- "woba" %in% selected_stats
   has_pct <- any(selected_stats %in% c("swing_pct", "whiff_pct", "chase_pct", "iz_whiff_pct", "iz_damage_pct"))
   
-  # Build the plot
+  # Build the plot - unclass to avoid jsonlite serialization warnings
   color_vals <- setNames(
-    sapply(selected_stats, function(s) stat_mapping[[s]]$color),
-    sapply(selected_stats, function(s) stat_mapping[[s]]$label)
+    sapply(selected_stats, function(s) stat_mapping[[s]]$color, USE.NAMES = FALSE),
+    sapply(selected_stats, function(s) stat_mapping[[s]]$label, USE.NAMES = FALSE)
   )
   
   p <- ggplot(plot_data, aes(x = Date, y = value, color = stat_label, group = stat_label)) +
@@ -2268,50 +2360,48 @@ app_ui <- fluidPage(
         column(9, uiOutput("hitter_detail_panel")))
     ),
     
-    # ===== xRV MATCHUP MATRIX TAB (PITCHER-CENTRIC) =====
-    tabPanel("xRV Matchup Matrix",
+    # ===== MAC MATCHUP MATRIX TAB =====
+    # Based on: "Using Euclidean Distance and Clustering to quantify batter vs. pitcher matchups"
+    # by Chap Cunningham and Zack Aisen (Saber Seminar 2025)
+    tabPanel("MAC Matchup Matrix",
       div(class = "stats-header", 
-          h3("Pitcher-Centric xRV Matrix"), 
-          p("Pitcher xRV vs SEC hitters by batter hand and pitch family. Add hitter names and notes manually.")),
+          h3("MAC Matchup Analysis"),
+          p("Matchup Analysis using Euclidean Distance and Clustering (MAC) - Score 0-100 where 100 = Pitcher Advantage")),
       
       fluidRow(
         column(12,
           div(class = "chart-box", style = "margin-top: 15px;",
-            div(class = "chart-box-title", "Pitcher xRV vs Batter Hand (SEC Data)"),
+            div(class = "chart-box-title", "MAC Batter vs Pitcher Matchups"),
             fluidRow(
               column(4,
-                selectizeInput("xrv_pitchers", "Select Pitchers:", choices = NULL, multiple = TRUE,
+                selectizeInput("mac_pitchers", "Select Pitchers:", choices = NULL, multiple = TRUE,
                                options = list(placeholder = "Search pitchers...", maxItems = 12))),
               column(4,
-                div(style = "margin-top: 5px;",
-                  tags$label("Hitter Lineup (one per line, format: Name,Hand)"),
-                  tags$textarea(id = "hitter_lineup_input", 
-                               rows = 6, 
-                               style = "width: 100%; font-size: 11px; font-family: monospace;",
-                               placeholder = "Hitter Name, L\nHitter Name, R\nHitter Name, S"))),
+                selectizeInput("mac_hitters", "Select Hitters:", choices = NULL, multiple = TRUE,
+                               options = list(placeholder = "Search hitters...", maxItems = 12))),
               column(4,
                 div(style = "margin-top: 25px;",
-                  actionButton("generate_xrv_matrix", "Generate Matrix", class = "btn-bronze", style = "width: 100%; margin-bottom: 10px;"),
-                  downloadButton("download_xrv_png", "Download as PNG", class = "btn-bronze", style = "width: 100%;")))
+                  actionButton("generate_mac_matrix", "Generate MAC Matrix", class = "btn-bronze", style = "width: 100%; margin-bottom: 10px;"),
+                  downloadButton("download_mac_png", "Download as PNG", class = "btn-bronze", style = "width: 100%;")))
             ),
             div(style = "margin-top: 10px; padding: 10px; background: #f5f5f5; border-radius: 5px;",
               div(style = "font-size: 12px; color: #333;",
-                tags$b("xRV Interpretation (Pitcher Perspective):"), " Negative (-) = Pitcher Advantage, Positive (+) = Hitter Advantage"),
-              div(style = "display: flex; gap: 15px; margin-top: 5px; font-size: 11px;",
-                tags$span(style = "background: #C8E6C9; padding: 2px 8px; border-radius: 3px;", "-1.5+ Strong P"),
-                tags$span(style = "background: #DCEDC8; padding: 2px 8px; border-radius: 3px;", "-0.5 to -1.5 Pitcher"),
-                tags$span(style = "background: #FFF9C4; padding: 2px 8px; border-radius: 3px;", "-0.5 to +0.5 Neutral"),
-                tags$span(style = "background: #FFE0B2; padding: 2px 8px; border-radius: 3px;", "+0.5 to +1.5 Hitter"),
-                tags$span(style = "background: #FFCDD2; padding: 2px 8px; border-radius: 3px;", "+1.5+ Strong H")
+                tags$b("MAC Score (0-100):"), " Uses Euclidean distance (threshold 0.6) to find similar pitches hitters have faced."),
+              div(style = "display: flex; gap: 10px; margin-top: 8px; font-size: 11px; flex-wrap: wrap;",
+                tags$span(style = "background: #1B5E20; color: white; padding: 3px 10px; border-radius: 3px;", "80-100 Strong Pitcher"),
+                tags$span(style = "background: #4CAF50; color: white; padding: 3px 10px; border-radius: 3px;", "60-79 Pitcher Adv"),
+                tags$span(style = "background: #FFF9C4; padding: 3px 10px; border-radius: 3px;", "40-59 Neutral"),
+                tags$span(style = "background: #FF9800; color: white; padding: 3px 10px; border-radius: 3px;", "20-39 Hitter Adv"),
+                tags$span(style = "background: #C62828; color: white; padding: 3px 10px; border-radius: 3px;", "0-19 Strong Hitter")
               ),
               div(style = "margin-top: 8px; font-size: 11px; color: #666;",
-                tags$b("Hitter Input:"), " Enter lineup with hand (L=Left, R=Right, S=Switch). For switch hitters, matrix shows vs opposite hand pitcher.",
+                tags$b("Methodology:"), " Scans features (Velo, IVB, HB, Spin, Rel Ht, Rel Side) to find similar pitches. Click cells to add notes.",
                 tags$br(),
-                tags$b("Note:"), " xRV data is pitcher performance vs SEC hitters by batter hand. Use notes for hitter-specific adjustments.")
+                tags$b("RV/100:"), " Run Value per 100 pitches on similar pitches (+ = Hitter advantage). FB/BB/OS = Fastball/Breaking/Offspeed.")
             ),
             hr(),
-            div(id = "xrv_matrix_container", style = "overflow-x: auto;", 
-                uiOutput("xrv_matrix_output"))
+            div(id = "mac_matrix_container", style = "overflow-x: auto;", 
+                uiOutput("mac_matrix_output"))
           )
         )
       )
@@ -2350,16 +2440,17 @@ server <- function(input, output, session) {
   
   scout_data <- reactiveVal(list())
   selected_hitter <- reactiveVal(NULL)
-  # xRV Matrix reactive values
-  xrv_matrix_data <- reactiveVal(NULL)
-  xrv_notes <- reactiveVal(list())  # Store notes for each matchup
+  # MAC Matrix reactive values
+  mac_matrix_data <- reactiveVal(NULL)
+  mac_notes <- reactiveVal(list())  # Store notes for each matchup cell
   
   # Initialize all selectize inputs AFTER login
   observeEvent(logged_in(), {
     if (logged_in()) {
       updateSelectizeInput(session, "scout_hitters", choices = all_hitters, server = TRUE) 
-      # xRV Matchup Matrix inputs (pitcher-centric - hitters entered manually)
-      updateSelectizeInput(session, "xrv_pitchers", choices = all_pitchers, server = TRUE)
+      # MAC Matchup Matrix inputs
+      updateSelectizeInput(session, "mac_pitchers", choices = all_pitchers, server = TRUE)
+      updateSelectizeInput(session, "mac_hitters", choices = all_hitters, server = TRUE)
     }
   }, ignoreInit = TRUE)
   
@@ -3451,278 +3542,248 @@ output$download_scout_pdf <- downloadHandler(
   )
                                                 
   # ============================================================================
-  # xRV MATCHUP MATRIX SERVER LOGIC (PITCHER-CENTRIC)
+  # MAC MATCHUP MATRIX SERVER LOGIC
+  # Based on: "Using Euclidean Distance and Clustering to quantify batter vs. pitcher matchups"
+  # by Chap Cunningham and Zack Aisen (Saber Seminar 2025)
   # ============================================================================
   
-  # Helper to parse hitter lineup input
-  parse_hitter_lineup <- function(input_text) {
-    if (is.null(input_text) || trimws(input_text) == "") {
-      return(NULL)
-    }
-    
-    lines <- strsplit(input_text, "\n")[[1]]
-    lines <- trimws(lines)
-    lines <- lines[lines != ""]
-    
-    hitters <- lapply(lines, function(line) {
-      parts <- strsplit(line, ",")[[1]]
-      if (length(parts) >= 2) {
-        name <- trimws(parts[1])
-        hand <- toupper(trimws(parts[2]))
-        # Normalize hand: L, R, or S (switch)
-        if (hand %in% c("L", "LEFT")) hand <- "L"
-        else if (hand %in% c("R", "RIGHT")) hand <- "R"
-        else if (hand %in% c("S", "SWITCH", "B", "BOTH")) hand <- "S"
-        else hand <- "R"  # Default to R if unclear
-        list(name = name, hand = hand)
-      } else {
-        # Just a name, default to R
-        list(name = trimws(line), hand = "R")
-      }
-    })
-    
-    hitters
+  # Helper function for MAC score color (0-100 scale, higher = pitcher advantage)
+  get_mac_score_color <- function(score) {
+    if (is.na(score)) return("#E0E0E0")
+    if (score >= 80) return("#1B5E20")  # Dark green - strong pitcher
+    if (score >= 60) return("#4CAF50")  # Green - pitcher advantage
+    if (score >= 55) return("#8BC34A")  # Light green - slight pitcher
+    if (score >= 45) return("#FFF9C4")  # Yellow - neutral
+    if (score >= 40) return("#FFEB3B")  # Yellow - neutral
+    if (score >= 20) return("#FF9800")  # Orange - hitter advantage
+    return("#C62828")                    # Red - strong hitter
   }
   
-  # Generate xRV Matchup Matrix (PITCHER-CENTRIC - FAST!)
-  observeEvent(input$generate_xrv_matrix, {
-    req(input$xrv_pitchers)
+  # Helper function for MAC score text color
+  get_mac_text_color <- function(score) {
+    if (is.na(score)) return("#666666")
+    if (score >= 60 || score <= 20) return("white")
+    return("#333333")
+  }
+  
+  # Generate MAC Matchup Matrix using Euclidean distance similarity
+  observeEvent(input$generate_mac_matrix, {
+    req(input$mac_pitchers, input$mac_hitters)
     
-    pitchers <- input$xrv_pitchers
-    hitter_input <- input$hitter_lineup_input
+    pitchers <- input$mac_pitchers
+    hitters <- input$mac_hitters
     
     if (length(pitchers) == 0) {
       showNotification("Please select at least one pitcher", type = "warning")
       return()
     }
     
-    # Parse hitter lineup
-    hitters <- parse_hitter_lineup(hitter_input)
-    
-    if (is.null(hitters) || length(hitters) == 0) {
-      # No hitters specified - just show pitcher stats vs L and R
-      hitters <- list(
-        list(name = "vs LHB", hand = "L"),
-        list(name = "vs RHB", hand = "R")
-      )
+    if (length(hitters) == 0) {
+      showNotification("Please select at least one hitter", type = "warning")
+      return()
     }
     
-    # Build results - FAST lookup from pre-calculated data
+    # Build results using MAC methodology
     results_list <- list()
     
-    withProgress(message = "Building pitcher matrix...", value = 0, {
-      total <- length(pitchers)
+    withProgress(message = "Computing MAC matchups...", value = 0, {
+      total <- length(pitchers) * length(hitters)
+      current <- 0
       
-      for (p_idx in seq_along(pitchers)) {
-        pitcher <- pitchers[p_idx]
-        
-        # Get pitcher stats (already calculated at startup)
-        pitcher_stats <- get_pitcher_matrix_stats(pitcher)
-        
-        for (h_idx in seq_along(hitters)) {
-          h_info <- hitters[[h_idx]]
-          h_name <- h_info$name
-          h_hand <- h_info$hand
+      for (pitcher in pitchers) {
+        for (hitter in hitters) {
+          key <- paste0(pitcher, "||", hitter)
           
-          key <- paste0(pitcher, "||", h_name)
+          # Calculate MAC matchup using Euclidean distance (0.6 threshold)
+          mac_result <- calculate_mac_matchup(pitcher, hitter, MAC_DISTANCE_THRESHOLD)
           
-          # Determine which batter side to use
-          if (h_hand == "S") {
-            # Switch hitter - use opposite of pitcher hand
-            if (pitcher_stats$pitcher_hand == "Right") {
-              batter_side <- "Left"
-            } else {
-              batter_side <- "Right"
-            }
-          } else if (h_hand == "L") {
-            batter_side <- "Left"
-          } else {
-            batter_side <- "Right"
-          }
-          
-          # Get the stats for this matchup
-          if (batter_side == "Left") {
-            stats <- pitcher_stats$vs_lhb
-          } else {
-            stats <- pitcher_stats$vs_rhb
-          }
+          # Also get pitch-type specific scores
+          fb_mac <- calculate_pitch_type_matchup(pitcher, hitter, "FB", MAC_DISTANCE_THRESHOLD)
+          bb_mac <- calculate_pitch_type_matchup(pitcher, hitter, "BB", MAC_DISTANCE_THRESHOLD)
+          os_mac <- calculate_pitch_type_matchup(pitcher, hitter, "OS", MAC_DISTANCE_THRESHOLD)
           
           results_list[[key]] <- list(
-            overall_xrv = stats$overall_xrv,
-            fb_xrv = stats$fb_xrv,
-            bb_xrv = stats$bb_xrv,
-            os_xrv = stats$os_xrv,
-            n_pitches = stats$n_pitches,
-            whiff_pct = stats$whiff_pct,
-            chase_pct = stats$chase_pct,
-            batter_side = batter_side,
-            hitter_hand = h_hand
+            score = mac_result$score,
+            rv100 = mac_result$rv100,
+            n_similar = mac_result$n_similar,
+            whiff_pct = mac_result$whiff_pct,
+            chase_pct = mac_result$chase_pct,
+            woba = mac_result$woba,
+            confidence = mac_result$confidence,
+            fb_score = fb_mac$score,
+            fb_rv = fb_mac$rv100,
+            fb_n = fb_mac$n_similar,
+            bb_score = bb_mac$score,
+            bb_rv = bb_mac$rv100,
+            bb_n = bb_mac$n_similar,
+            os_score = os_mac$score,
+            os_rv = os_mac$rv100,
+            os_n = os_mac$n_similar
           )
+          
+          current <- current + 1
+          incProgress(1/total)
         }
-        
-        incProgress(1/total)
       }
     })
     
-    # Store hitter info with names
-    hitter_names <- sapply(hitters, function(h) h$name)
-    hitter_hands <- sapply(hitters, function(h) h$hand)
-    
-    xrv_matrix_data(list(
+    mac_matrix_data(list(
       results = results_list, 
       pitchers = pitchers, 
-      hitters = hitter_names,
-      hitter_hands = hitter_hands
+      hitters = hitters
     ))
-    showNotification("Matrix generated!", type = "message")
+    showNotification("MAC Matrix generated!", type = "message")
   })
   
   # Handle note updates from matrix cells
-  observeEvent(input$xrv_note_update, {
-    note_data <- input$xrv_note_update
+  observeEvent(input$mac_note_update, {
+    note_data <- input$mac_note_update
     if (!is.null(note_data)) {
-      current_notes <- xrv_notes()
+      current_notes <- mac_notes()
       current_notes[[note_data$key]] <- note_data$value
-      xrv_notes(current_notes)
+      mac_notes(current_notes)
     }
   })
   
-  # Render xRV Matchup Matrix (PITCHER-CENTRIC)
-  output$xrv_matrix_output <- renderUI({
-    data <- xrv_matrix_data()
+  # Render MAC Matchup Matrix
+  output$mac_matrix_output <- renderUI({
+    data <- mac_matrix_data()
     if (is.null(data)) {
       return(div(style = "text-align: center; padding: 40px; color: #666;",
-                 p("Select pitchers and enter hitter lineup, then click 'Generate Matrix'."),
+                 p("Select pitchers and hitters, then click 'Generate MAC Matrix'."),
                  p(style = "font-size: 12px; margin-top: 10px;", 
-                   "Shows pitcher xRV vs SEC hitters by batter hand. Enter hitters as 'Name, L' or 'Name, R' (or S for switch).")))
+                   "MAC uses Euclidean distance to find similar pitches hitters have faced, providing a matchup score from 0-100.")))
     }
     
     results <- data$results
     pitchers <- data$pitchers
     hitters <- data$hitters
-    hitter_hands <- data$hitter_hands
-    current_notes <- xrv_notes()
+    current_notes <- mac_notes()
     
-    # Build HTML table with pitchers on top, hitters on side
+    # Build HTML table with hitters on rows, pitchers on columns
     # Header row with pitcher names
     header_cells <- lapply(pitchers, function(p) {
-      # Get pitcher hand
       p_hand <- pitcher_arsenal %>% filter(Pitcher == p) %>% pull(PitcherThrows) %>% unique() %>% first()
       p_hand_label <- if(!is.na(p_hand)) paste0(" (", substr(p_hand, 1, 1), "HP)") else ""
       
-      tags$th(style = "padding: 10px; background: #006F71; color: white; font-size: 11px; min-width: 150px; text-align: center; vertical-align: bottom;", 
+      tags$th(style = "padding: 10px; background: #006F71; color: white; font-size: 11px; min-width: 170px; text-align: center; vertical-align: bottom;", 
               div(style = "font-weight: bold;", substr(p, 1, 18)),
               div(style = "font-size: 9px; font-weight: normal;", p_hand_label))
     })
     
     # Table rows - one per hitter
-    table_rows <- lapply(seq_along(hitters), function(h_idx) {
-      h_name <- hitters[h_idx]
-      h_hand <- if(h_idx <= length(hitter_hands)) hitter_hands[h_idx] else "R"
+    table_rows <- lapply(hitters, function(h_name) {
+      # Get hitter hand
+      h_hand <- tm_data %>% filter(Batter == h_name) %>% pull(BatterSide) %>% first()
+      h_hand_label <- if(!is.na(h_hand)) paste0("(", substr(h_hand, 1, 1), ")") else ""
       
       # Create cells for each pitcher
-      matchup_cells <- lapply(seq_along(pitchers), function(p_idx) {
-        pitcher <- pitchers[p_idx]
+      matchup_cells <- lapply(pitchers, function(pitcher) {
         key <- paste0(pitcher, "||", h_name)
-        
         matchup <- results[[key]]
         
-        if (is.null(matchup) || is.na(matchup$overall_xrv)) {
+        if (is.null(matchup) || is.na(matchup$score)) {
           return(tags$td(style = "padding: 8px; text-align: center; background: #E0E0E0; vertical-align: top;",
-                        div(style = "font-size: 12px; color: #666;", "N/A"),
+                        div(style = "font-size: 14px; color: #666;", "N/A"),
+                        div(style = "font-size: 10px; color: #888; margin-top: 3px;", "Insufficient data"),
                         tags$textarea(
-                          class = "xrv-note-input",
-                          style = "width: 100%; height: 40px; font-size: 9px; border: 1px solid #ccc; border-radius: 3px; padding: 2px; resize: none; margin-top: 5px;",
-                          placeholder = "Hitter notes...",
-                          onchange = sprintf("Shiny.setInputValue('xrv_note_update', {key: '%s', value: this.value}, {priority: 'event'});", key)
+                          class = "mac-note-input",
+                          style = "width: 100%; height: 35px; font-size: 9px; border: 1px solid #ccc; border-radius: 3px; padding: 2px; resize: none; margin-top: 5px;",
+                          placeholder = "Notes...",
+                          onchange = sprintf("Shiny.setInputValue('mac_note_update', {key: '%s', value: this.value}, {priority: 'event'});", key)
                         )))
         }
         
-        # Colors based on xRV (from pitcher perspective - negative is good for pitcher)
-        overall_bg <- get_xrv_color(matchup$overall_xrv)
-        overall_text <- get_xrv_text_color(matchup$overall_xrv)
+        # Get colors based on MAC score
+        score_bg <- get_mac_score_color(matchup$score)
+        score_text <- get_mac_text_color(matchup$score)
         
-        fb_bg <- get_xrv_color(matchup$fb_xrv)
-        bb_bg <- get_xrv_color(matchup$bb_xrv)
-        os_bg <- get_xrv_color(matchup$os_xrv)
+        fb_bg <- get_mac_score_color(matchup$fb_score)
+        bb_bg <- get_mac_score_color(matchup$bb_score)
+        os_bg <- get_mac_score_color(matchup$os_score)
         
-        # Format xRV values
-        format_xrv <- function(val) {
-          if (is.na(val)) return("-")
-          sprintf("%+.1f", val)
-        }
-        
-        format_pct <- function(val) {
-          if (is.na(val)) return("-")
-          sprintf("%.0f%%", val)
-        }
+        # Format values
+        format_score <- function(val) if(is.na(val)) "-" else sprintf("%d", val)
+        format_rv <- function(val) if(is.na(val)) "-" else sprintf("%+.1f", val)
+        format_pct <- function(val) if(is.na(val)) "-" else sprintf("%.0f%%", val)
         
         # Get existing note
         existing_note <- if (!is.null(current_notes[[key]])) current_notes[[key]] else ""
         
+        # Confidence badge color
+        conf_color <- switch(matchup$confidence,
+          "High" = "#4CAF50",
+          "Medium" = "#FF9800", 
+          "#F44336")
+        
         # Cell content
-        tags$td(style = paste0("padding: 6px; vertical-align: top; background: ", overall_bg, "; border: 1px solid #ddd;"),
-          # Overall xRV (prominent)
-          div(style = paste0("text-align: center; font-size: 20px; font-weight: bold; color: ", overall_text, "; margin-bottom: 4px;"),
-              format_xrv(matchup$overall_xrv)),
+        tags$td(style = paste0("padding: 6px; vertical-align: top; background: ", score_bg, "; border: 1px solid #ddd;"),
+          # Overall MAC Score (large, prominent)
+          div(style = paste0("text-align: center; font-size: 28px; font-weight: bold; color: ", score_text, ";"),
+              format_score(matchup$score)),
           
-          # Pitch group breakdown
-          div(style = "display: flex; justify-content: space-around; font-size: 10px; margin-bottom: 4px;",
-            tags$span(style = paste0("background: ", fb_bg, "; padding: 2px 4px; border-radius: 3px;"),
-                     "FB: ", format_xrv(matchup$fb_xrv)),
-            tags$span(style = paste0("background: ", os_bg, "; padding: 2px 4px; border-radius: 3px;"),
-                     "OS: ", format_xrv(matchup$os_xrv)),
-            tags$span(style = paste0("background: ", bb_bg, "; padding: 2px 4px; border-radius: 3px;"),
-                     "BB: ", format_xrv(matchup$bb_xrv))
+          # Confidence and sample size
+          div(style = "text-align: center; margin-top: 2px;",
+              tags$span(style = paste0("font-size: 9px; padding: 1px 5px; border-radius: 3px; background: ", conf_color, "; color: white;"),
+                       matchup$confidence),
+              tags$span(style = "font-size: 9px; color: #666; margin-left: 5px;", 
+                       paste0("n=", matchup$n_similar))),
+          
+          # RV/100 and key metrics
+          div(style = "text-align: center; font-size: 10px; color: #444; margin-top: 4px;",
+              paste0("RV/100: ", format_rv(matchup$rv100))),
+          
+          div(style = "display: flex; justify-content: center; gap: 8px; font-size: 9px; margin-top: 3px; color: #555;",
+              tags$span(paste0("W:", format_pct(matchup$whiff_pct))),
+              tags$span(paste0("Ch:", format_pct(matchup$chase_pct)))),
+          
+          # Pitch type breakdown with mini-scores
+          div(style = "display: flex; justify-content: space-around; font-size: 9px; margin-top: 5px; padding-top: 5px; border-top: 1px solid rgba(0,0,0,0.1);",
+              tags$span(style = paste0("background: ", fb_bg, "; color: ", get_mac_text_color(matchup$fb_score), "; padding: 2px 5px; border-radius: 3px;"),
+                       paste0("FB:", format_score(matchup$fb_score))),
+              tags$span(style = paste0("background: ", bb_bg, "; color: ", get_mac_text_color(matchup$bb_score), "; padding: 2px 5px; border-radius: 3px;"),
+                       paste0("BB:", format_score(matchup$bb_score))),
+              tags$span(style = paste0("background: ", os_bg, "; color: ", get_mac_text_color(matchup$os_score), "; padding: 2px 5px; border-radius: 3px;"),
+                       paste0("OS:", format_score(matchup$os_score)))
           ),
           
-          # Sample size and rates
-          div(style = "text-align: center; font-size: 9px; color: #666; margin-bottom: 3px;",
-              paste0("n=", matchup$n_pitches, " | W:", format_pct(matchup$whiff_pct), " Ch:", format_pct(matchup$chase_pct))),
-          
-          # Side indicator
-          div(style = "text-align: center; font-size: 8px; color: #888; margin-bottom: 3px;",
-              paste0("(vs ", matchup$batter_side, ")")),
-          
-          # Notes input for hitter-specific info
+          # Notes input
           tags$textarea(
-            class = "xrv-note-input",
-            style = "width: 100%; height: 40px; font-size: 9px; border: 1px solid #ccc; border-radius: 3px; padding: 2px; resize: none;",
-            placeholder = "Hitter adjustments...",
-            onchange = sprintf("Shiny.setInputValue('xrv_note_update', {key: '%s', value: this.value}, {priority: 'event'});", key),
+            class = "mac-note-input",
+            style = "width: 100%; height: 35px; font-size: 9px; border: 1px solid rgba(0,0,0,0.15); border-radius: 3px; padding: 2px; resize: none; margin-top: 5px; background: rgba(255,255,255,0.7);",
+            placeholder = "Notes...",
+            onchange = sprintf("Shiny.setInputValue('mac_note_update', {key: '%s', value: this.value}, {priority: 'event'});", key),
             existing_note
           )
         )
       })
       
-      # Hitter row with hand indicator
-      hand_label <- switch(h_hand, "L" = "(L)", "R" = "(R)", "S" = "(S)", "(R)")
-      
       tags$tr(
-        tags$td(style = "padding: 8px; background: #f5f5f5; font-weight: bold; font-size: 11px; vertical-align: middle; min-width: 130px;", 
-                div(substr(h_name, 1, 18)),
-                div(style = "font-size: 9px; color: #666; font-weight: normal;", hand_label)),
+        tags$td(style = "padding: 8px; background: #f5f5f5; font-weight: bold; font-size: 11px; vertical-align: middle; min-width: 140px;", 
+                div(substr(h_name, 1, 20)),
+                div(style = "font-size: 9px; color: #666; font-weight: normal;", h_hand_label)),
         matchup_cells
       )
     })
     
     # Legend row at bottom
     legend_row <- tags$tr(
-      tags$td(colspan = length(pitchers) + 1, style = "padding: 10px; background: #fafafa; font-size: 10px; color: #666;",
-        div(style = "display: flex; justify-content: center; gap: 20px; flex-wrap: wrap;",
-          tags$span(tags$b("xRV"), " = Pitcher Run Value/100 vs SEC (neg = pitcher advantage)"),
-          tags$span(tags$b("FB"), " = Fastballs"),
-          tags$span(tags$b("OS"), " = Offspeed"),
-          tags$span(tags$b("BB"), " = Breaking"),
-          tags$span(tags$b("W"), " = Whiff%"),
-          tags$span(tags$b("Ch"), " = Chase%")
-        )
+      tags$td(colspan = length(pitchers) + 1, style = "padding: 12px; background: #fafafa; font-size: 10px; color: #666;",
+        div(style = "display: flex; justify-content: center; gap: 25px; flex-wrap: wrap;",
+          tags$span(tags$b("MAC Score:"), " 0-100 (100 = Strong Pitcher Advantage)"),
+          tags$span(tags$b("RV/100:"), " Run Value per 100 similar pitches"),
+          tags$span(tags$b("FB/BB/OS:"), " Fastball/Breaking/Offspeed scores"),
+          tags$span(tags$b("W:"), " Whiff%"),
+          tags$span(tags$b("Ch:"), " Chase%")
+        ),
+        div(style = "text-align: center; margin-top: 5px; font-size: 9px;",
+            "Methodology: Scans pitches using Euclidean distance (threshold 0.6) on Velocity, IVB, HB, Spin, Release Height, Release Side")
       )
     )
     
     tagList(
       tags$style(HTML("
-        .xrv-note-input:focus {
+        .mac-note-input:focus {
           outline: 2px solid #006F71;
           border-color: #006F71;
         }
@@ -3738,15 +3799,14 @@ output$download_scout_pdf <- downloadHandler(
     )
   })
   
-  # Download xRV Matrix as PNG (PITCHER-CENTRIC)
-  output$download_xrv_png <- downloadHandler(
+  # Download MAC Matrix as PNG
+  output$download_mac_png <- downloadHandler(
     filename = function() {
-      paste0("Pitcher_xRV_Matrix_", format(Sys.Date(), "%Y%m%d"), ".png")
+      paste0("MAC_Matchup_Matrix_", format(Sys.Date(), "%Y%m%d"), ".png")
     },
     content = function(file) {
-      data <- xrv_matrix_data()
+      data <- mac_matrix_data()
       if (is.null(data)) {
-        # Create empty placeholder
         png(file, width = 400, height = 200)
         plot.new()
         text(0.5, 0.5, "No data to export. Generate matrix first.", cex = 1.2)
@@ -3757,41 +3817,37 @@ output$download_scout_pdf <- downloadHandler(
       results <- data$results
       pitchers <- data$pitchers
       hitters <- data$hitters
-      hitter_hands <- if(!is.null(data$hitter_hands)) data$hitter_hands else rep("R", length(hitters))
-      current_notes <- xrv_notes()
+      current_notes <- mac_notes()
       
       # Calculate dimensions
       n_pitchers <- length(pitchers)
       n_hitters <- length(hitters)
       
-      cell_width <- 130
-      cell_height <- 85
+      cell_width <- 150
+      cell_height <- 100
       header_height <- 50
-      row_label_width <- 160
+      row_label_width <- 170
       
       img_width <- row_label_width + n_pitchers * cell_width + 40
-      img_height <- header_height + n_hitters * cell_height + 80
+      img_height <- header_height + n_hitters * cell_height + 100
       
       png(file, width = img_width, height = img_height, res = 100)
       
       grid::grid.newpage()
       
       # Title
-      grid::grid.text("Pitcher xRV Matrix (vs SEC by Batter Hand)", x = 0.5, y = 0.97, 
+      grid::grid.text("MAC Matchup Matrix (Euclidean Distance Method)", x = 0.5, y = 0.97, 
                      gp = grid::gpar(fontsize = 14, fontface = "bold", col = "#006F71"))
-      grid::grid.text(paste0("Generated: ", Sys.Date()), x = 0.5, y = 0.94,
+      grid::grid.text(paste0("Generated: ", Sys.Date(), " | Score: 0-100 (100 = Pitcher Advantage)"), x = 0.5, y = 0.94,
                      gp = grid::gpar(fontsize = 9, col = "gray50"))
       
-      # Calculate viewport dimensions
       plot_top <- 0.90
-      plot_height <- 0.85
       
       # Draw header row (pitcher names)
       for (p_idx in seq_along(pitchers)) {
         x_pos <- (row_label_width + (p_idx - 0.5) * cell_width) / img_width
         y_pos <- plot_top
         
-        # Get pitcher hand
         p_hand <- pitcher_arsenal %>% filter(Pitcher == pitchers[p_idx]) %>% pull(PitcherThrows) %>% unique() %>% first()
         p_label <- if(!is.na(p_hand)) paste0(substr(pitchers[p_idx], 1, 14), " (", substr(p_hand, 1, 1), ")") else substr(pitchers[p_idx], 1, 15)
         
@@ -3805,20 +3861,19 @@ output$download_scout_pdf <- downloadHandler(
       grid::grid.rect(x = (row_label_width / 2) / img_width, y = plot_top, 
                      width = (row_label_width - 4) / img_width, height = 0.04,
                      gp = grid::gpar(fill = "#37474F", col = "white"))
-      grid::grid.text("Hitter (Hand)", x = (row_label_width / 2) / img_width, y = plot_top,
+      grid::grid.text("Hitter", x = (row_label_width / 2) / img_width, y = plot_top,
                      gp = grid::gpar(fontsize = 9, col = "white", fontface = "bold"))
       
       # Draw data rows
       for (h_idx in seq_along(hitters)) {
         hitter <- hitters[h_idx]
-        h_hand <- if(h_idx <= length(hitter_hands)) hitter_hands[h_idx] else "R"
         row_y <- plot_top - 0.04 - (h_idx - 0.5) * (cell_height / img_height)
         
-        # Hitter name cell with hand
+        # Hitter name cell
         grid::grid.rect(x = (row_label_width / 2) / img_width, y = row_y,
                        width = (row_label_width - 4) / img_width, height = (cell_height - 2) / img_height,
                        gp = grid::gpar(fill = "#f5f5f5", col = "#ddd"))
-        grid::grid.text(paste0(substr(hitter, 1, 18), " (", h_hand, ")"), x = (row_label_width / 2) / img_width, y = row_y,
+        grid::grid.text(substr(hitter, 1, 20), x = (row_label_width / 2) / img_width, y = row_y,
                        gp = grid::gpar(fontsize = 8, fontface = "bold"))
         
         # Data cells
@@ -3829,42 +3884,43 @@ output$download_scout_pdf <- downloadHandler(
           
           x_pos <- (row_label_width + (p_idx - 0.5) * cell_width) / img_width
           
-          if (is.null(matchup) || is.na(matchup$overall_xrv)) {
+          if (is.null(matchup) || is.na(matchup$score)) {
             grid::grid.rect(x = x_pos, y = row_y,
                            width = (cell_width - 2) / img_width, height = (cell_height - 2) / img_height,
                            gp = grid::gpar(fill = "#E0E0E0", col = "#ddd"))
             grid::grid.text("N/A", x = x_pos, y = row_y,
-                           gp = grid::gpar(fontsize = 10, col = "#666"))
+                           gp = grid::gpar(fontsize = 12, col = "#666"))
           } else {
-            bg_col <- get_xrv_color(matchup$overall_xrv)
-            text_col <- get_xrv_text_color(matchup$overall_xrv)
+            bg_col <- get_mac_score_color(matchup$score)
+            text_col <- get_mac_text_color(matchup$score)
             
             grid::grid.rect(x = x_pos, y = row_y,
                            width = (cell_width - 2) / img_width, height = (cell_height - 2) / img_height,
                            gp = grid::gpar(fill = bg_col, col = "#ddd"))
             
-            # Overall xRV
-            grid::grid.text(sprintf("%+.1f", matchup$overall_xrv), x = x_pos, y = row_y + 0.025,
-                           gp = grid::gpar(fontsize = 14, fontface = "bold", col = text_col))
+            # MAC Score (large)
+            grid::grid.text(sprintf("%d", matchup$score), x = x_pos, y = row_y + 0.03,
+                           gp = grid::gpar(fontsize = 18, fontface = "bold", col = text_col))
             
-            # Pitch breakdown
-            format_xrv_short <- function(val) if(is.na(val)) "-" else sprintf("%+.1f", val)
-            breakdown_text <- paste0("FB:", format_xrv_short(matchup$fb_xrv), 
-                                    " OS:", format_xrv_short(matchup$os_xrv),
-                                    " BB:", format_xrv_short(matchup$bb_xrv))
-            grid::grid.text(breakdown_text, x = x_pos, y = row_y - 0.005,
-                           gp = grid::gpar(fontsize = 7, col = "gray30"))
+            # RV/100
+            format_rv <- function(val) if(is.na(val)) "-" else sprintf("%+.1f", val)
+            grid::grid.text(paste0("RV/100: ", format_rv(matchup$rv100)), x = x_pos, y = row_y,
+                           gp = grid::gpar(fontsize = 7, col = text_col))
             
-            # n and rates
-            n_text <- paste0("n=", matchup$n_pitches)
-            grid::grid.text(n_text, x = x_pos, y = row_y - 0.025,
-                           gp = grid::gpar(fontsize = 6, col = "gray50"))
+            # Pitch type breakdown
+            breakdown_text <- paste0("FB:", matchup$fb_score, " BB:", matchup$bb_score, " OS:", matchup$os_score)
+            grid::grid.text(breakdown_text, x = x_pos, y = row_y - 0.02,
+                           gp = grid::gpar(fontsize = 6, col = text_col))
+            
+            # Sample size
+            grid::grid.text(paste0("n=", matchup$n_similar, " (", matchup$confidence, ")"), x = x_pos, y = row_y - 0.035,
+                           gp = grid::gpar(fontsize = 5, col = text_col))
             
             # Notes if present
             note <- current_notes[[key]]
             if (!is.null(note) && nchar(note) > 0) {
-              grid::grid.text(substr(note, 1, 20), x = x_pos, y = row_y - 0.04,
-                             gp = grid::gpar(fontsize = 6, col = "gray50", fontface = "italic"))
+              grid::grid.text(substr(note, 1, 18), x = x_pos, y = row_y - 0.05,
+                             gp = grid::gpar(fontsize = 5, col = text_col, fontface = "italic"))
             }
           }
         }
@@ -3872,7 +3928,7 @@ output$download_scout_pdf <- downloadHandler(
       
       # Legend
       legend_y <- 0.03
-      grid::grid.text("xRV = Pitcher Run Value/100 vs SEC  |  (-) Pitcher Advantage  |  (+) Hitter Advantage  |  FB=Fastball  OS=Offspeed  BB=Breaking",
+      grid::grid.text("MAC Score: 0-100 (100=Pitcher Adv) | Euclidean Distance Threshold: 0.6 | Features: Velo, IVB, HB, Spin, RelHt, RelSide",
                      x = 0.5, y = legend_y, gp = grid::gpar(fontsize = 8, col = "gray50"))
       
       dev.off()
