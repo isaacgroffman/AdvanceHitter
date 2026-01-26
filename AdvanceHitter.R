@@ -802,412 +802,113 @@ sec_priors <- calculate_sec_priors(sec_pool_data)
 cat("SEC priors calculated for", nrow(sec_priors), "pitch families (fallback only)\n")
 
 # ============================================================================
-# BATTER SIMILARITY PERFORMANCE CALCULATOR
+# PITCHER-CENTRIC xRV CALCULATION (SIMPLIFIED)
 # ============================================================================
-# Calculates batter's performance against pitches similar to a target profile
-# Uses Euclidean distance <= 1.0 in standardized pitch characteristic space
+# Pre-calculate pitcher xRV vs SEC hitters by batter side and pitch family
+# This is much faster than the previous batter-similarity approach
 
-calculate_batter_similar_pitch_performance <- function(batter_name, pitcher_hand, 
-                                                        target_velo, target_ivb, target_hb,
-                                                        target_spin, target_relh, target_rels,
-                                                        distance_threshold = 1.0) {
-  # Get batter's pitch history for this pitcher hand
-  batter_pitches <- batter_pitch_performance %>%
-    filter(Batter == batter_name, PitcherThrows == pitcher_hand)
-  
-  if (nrow(batter_pitches) < 10) {
-    return(list(xrv_similar = NA, n_similar = 0, whiff_rate = NA, chase_rate = NA))
-  }
-  
-  # Standardize target pitch characteristics
-  target <- list(
-    RelSpeed_z = (target_velo - feature_means$RelSpeed) / feature_sds$RelSpeed,
-    IVB_z = (target_ivb - feature_means$InducedVertBreak) / feature_sds$InducedVertBreak,
-    HB_z = (target_hb - feature_means$HorzBreak) / feature_sds$HorzBreak,
-    SpinRate_z = (target_spin - feature_means$SpinRate) / feature_sds$SpinRate,
-    RelHeight_z = (target_relh - feature_means$RelHeight) / feature_sds$RelHeight,
-    RelSide_z = (target_rels - feature_means$RelSide) / feature_sds$RelSide
-  )
-  
-  # Handle NAs in target
-  target <- lapply(target, function(x) if(is.na(x) || is.nan(x)) 0 else x)
-  
-  # Calculate Euclidean distance for each pitch batter has faced
-  batter_pitches_calc <- batter_pitches %>%
-    mutate(
-      RelSpeed_z_safe = ifelse(is.na(RelSpeed_z), 0, RelSpeed_z),
-      IVB_z_safe = ifelse(is.na(IVB_z), 0, IVB_z),
-      HB_z_safe = ifelse(is.na(HB_z), 0, HB_z),
-      SpinRate_z_safe = ifelse(is.na(SpinRate_z), 0, SpinRate_z),
-      RelHeight_z_safe = ifelse(is.na(RelHeight_z), 0, RelHeight_z),
-      RelSide_z_safe = ifelse(is.na(RelSide_z), 0, RelSide_z),
-      distance = sqrt(
-        (RelSpeed_z_safe - target$RelSpeed_z)^2 +
-          (IVB_z_safe - target$IVB_z)^2 +
-          (HB_z_safe - target$HB_z)^2 +
-          (SpinRate_z_safe - target$SpinRate_z)^2 +
-          (RelHeight_z_safe - target$RelHeight_z)^2 +
-          (RelSide_z_safe - target$RelSide_z)^2
-      )
-    )
-  
-  # Filter to similar pitches within Euclidean distance threshold
-  similar_pitches <- batter_pitches_calc %>%
-    filter(!is.na(distance), distance <= distance_threshold)
-  
-  n_similar <- nrow(similar_pitches)
-  
-  if (n_similar >= 5) {
-    xrv_similar <- mean(similar_pitches$hitter_rv, na.rm = TRUE)
-    whiff_rate <- sum(similar_pitches$WhiffIndicator, na.rm = TRUE) / 
-                  pmax(1, sum(similar_pitches$SwingIndicator, na.rm = TRUE))
-    chase_rate <- sum(similar_pitches$chase, na.rm = TRUE) / 
-                  pmax(1, sum(similar_pitches$out_of_zone, na.rm = TRUE))
-    
-    return(list(xrv_similar = xrv_similar, n_similar = n_similar, 
-                whiff_rate = whiff_rate, chase_rate = chase_rate))
-  }
-  
-  list(xrv_similar = NA, n_similar = n_similar, whiff_rate = NA, chase_rate = NA)
-}
+# Calculate pitcher xRV vs SEC hitters by batter hand and pitch family
+pitcher_sec_xrv <- tm_data %>%
+  filter(
+    !is.na(Pitcher),
+    !is.na(PitchFamily),
+    !is.na(mean_DRE_pit),
+    !is.na(BatterSide),
+    BatterTeam %in% sec_teams  # Only vs SEC hitters
+  ) %>%
+  group_by(Pitcher, PitcherThrows, BatterSide, PitchFamily) %>%
+  summarise(
+    n_pitches = n(),
+    xrv_per100 = mean(mean_DRE_pit, na.rm = TRUE) * 100,
+    whiff_pct = mean(is_whiff, na.rm = TRUE) * 100,
+    chase_pct = mean(chase, na.rm = TRUE) * 100,
+    .groups = "drop"
+  ) %>%
+  filter(n_pitches >= 10)
+
+# Also create overall pitcher xRV by batter side (not split by pitch family)
+pitcher_sec_xrv_overall <- tm_data %>%
+  filter(
+    !is.na(Pitcher),
+    !is.na(mean_DRE_pit),
+    !is.na(BatterSide),
+    BatterTeam %in% sec_teams
+  ) %>%
+  group_by(Pitcher, PitcherThrows, BatterSide) %>%
+  summarise(
+    n_pitches = n(),
+    xrv_per100 = mean(mean_DRE_pit, na.rm = TRUE) * 100,
+    whiff_pct = mean(is_whiff, na.rm = TRUE) * 100,
+    chase_pct = mean(chase, na.rm = TRUE) * 100,
+    .groups = "drop"
+  ) %>%
+  filter(n_pitches >= 20)
+
+cat("Built pitcher SEC xRV data:", nrow(pitcher_sec_xrv), "pitch family rows,", 
+    nrow(pitcher_sec_xrv_overall), "overall rows\n")
 
 # ============================================================================
-# BUILD TRAINING DATA WITH PITCH SIMILARITY FEATURES
+# PITCHER-CENTRIC MATCHUP FUNCTION (SIMPLIFIED - NO HITTER-SPECIFIC CALCS)
 # ============================================================================
+# Just looks up pre-calculated pitcher xRV vs SEC hitters by batter side
+# User can manually input hitter-specific adjustments in the UI
 
-build_xrv_training_data_with_similarity <- function(tm_data, distance_threshold = 1.0) {
-  cat("Building training data with pitch similarity features...\n")
+# Simple function to get pitcher xRV data for matchup matrix
+get_pitcher_sec_stats <- function(pitcher_name, batter_side) {
+  # Get overall stats for this pitcher vs batter side
+  overall_data <- pitcher_sec_xrv_overall %>%
+    filter(Pitcher == pitcher_name, BatterSide == batter_side)
   
-  # Sample pitches for training (for memory efficiency)
-  train_pitches <- tm_data %>%
-    filter(!is.na(PitchFamily), !is.na(mean_DRE_bat), !is.na(PitcherThrows),
-           !is.na(RelSpeed), !is.na(InducedVertBreak), !is.na(HorzBreak)) %>%
-    sample_n(min(50000, n()))
+  # Get pitch family breakdown
+  family_data <- pitcher_sec_xrv %>%
+    filter(Pitcher == pitcher_name, BatterSide == batter_side)
   
-  # For each pitch, calculate batter's historical performance against similar pitches
-  # This is done efficiently by pre-computing batter stats
-  cat("Pre-computing batter similarity stats for", n_distinct(train_pitches$Batter), "batters...\n")
-  
-  # Pre-aggregate batter stats by pitch characteristic bins for efficiency
-  batter_stats_cache <- list()
-  
-  train_with_features <- train_pitches %>%
-    rowwise() %>%
-    mutate(
-      # Calculate batter's performance against similar pitches to this one
-      similar_perf = list(calculate_batter_similar_pitch_performance(
-        Batter, PitcherThrows, RelSpeed, InducedVertBreak, HorzBreak,
-        ifelse(is.na(SpinRate), 2200, SpinRate),
-        ifelse(is.na(RelHeight), 6, RelHeight),
-        ifelse(is.na(RelSide), 0, RelSide),
-        distance_threshold
-      ))
-    ) %>%
-    ungroup() %>%
-    mutate(
-      batter_xrv_vs_similar = sapply(similar_perf, function(x) x$xrv_similar),
-      batter_n_similar = sapply(similar_perf, function(x) x$n_similar),
-      batter_whiff_vs_similar = sapply(similar_perf, function(x) x$whiff_rate),
-      batter_chase_vs_similar = sapply(similar_perf, function(x) x$chase_rate)
-    ) %>%
-    select(-similar_perf) %>%
-    # Filter to rows where we have batter similarity data
-    filter(!is.na(batter_xrv_vs_similar), batter_n_similar >= 5)
-  
-  cat("Built training data with", nrow(train_with_features), "samples\n")
-  train_with_features
-}
-
-# ============================================================================
-# TRAIN XGBOOST MODEL WITH PITCH SIMILARITY FEATURES
-# ============================================================================
-
-train_xrv_model_with_similarity <- function(tm_data, nrounds = 100, verbose = 0, 
-                                             distance_threshold = 1.0) {
-  cat("Training xRV model with pitch similarity features...\n")
-  
-  # Build training data with similarity features
-  train_df <- build_xrv_training_data_with_similarity(tm_data, distance_threshold)
-  
-  if (nrow(train_df) < 1000) {
-    cat("Insufficient training data for xRV model\n")
-    return(NULL)
-  }
-  
-  # Feature columns:
-  # - Pitcher pitch characteristics (velo, movement, spin, release point)
-  # - Pitcher effectiveness (mean_DRE_pit)
-  # - BATTER's performance against similar pitches (KEY DIFFERENTIATOR)
-  # - Batter whiff/chase rates against similar pitches
-  feature_cols <- c(
-    # Pitcher pitch characteristics
-    "RelSpeed", "InducedVertBreak", "HorzBreak", "SpinRate", "RelHeight", "RelSide",
-    # Pitcher effectiveness
-    "mean_DRE_pit",
-    # BATTER similarity-based features (differentiates hitters)
-    "batter_xrv_vs_similar",      # Batter's actual xRV against similar pitches
-    "batter_n_similar",           # Sample size for credibility
-    "batter_whiff_vs_similar",    # Batter whiff rate vs similar
-    "batter_chase_vs_similar"     # Batter chase rate vs similar
-  )
-  
-  # Prepare matrix - handle NAs
-  X <- train_df %>%
-    select(all_of(feature_cols)) %>%
-    mutate(across(everything(), ~ifelse(is.na(.), 0, .))) %>%
-    as.matrix()
-  
-  y <- train_df$mean_DRE_bat
-  
-  cat("Training xRV model on", nrow(X), "samples with", ncol(X), "features...\n")
-  cat("Features:", paste(feature_cols, collapse = ", "), "\n")
-  
-  # Create DMatrix
-  dtrain <- xgb.DMatrix(data = X, label = y)
-  
-  # XGBoost parameters - emphasize batter features
-  params <- list(
-    objective = "reg:squarederror",
-    max_depth = 5,
-    eta = 0.1,
-    subsample = 0.8,
-    colsample_bytree = 0.8,
-    min_child_weight = 5,
-    gamma = 0.05
-  )
-  
-  # Train model
-  model <- xgb.train(
-    params = params,
-    data = dtrain,
-    nrounds = nrounds,
-    verbose = verbose
-  )
-  
-  # Get feature importance
-  importance <- xgb.importance(feature_names = feature_cols, model = model)
-  cat("\nFeature Importance:\n")
-  print(importance)
-  
-  # Clean up
-  rm(dtrain, X)
-  gc(verbose = FALSE)
-  
-  cat("xRV model trained successfully\n")
-  
-  list(
-    model = model,
-    feature_cols = feature_cols
-  )
-}
-
-# Train the xRV model with pitch similarity features
-xrv_model_data <- train_xrv_model_with_similarity(tm_data, nrounds = 100, 
-                                                   distance_threshold = 1.0)
-
-# Build batter xRV features (for backward compatibility)
-build_batter_xrv_features <- function(tm_data, rolling_pa = 300) {
-  batter_perf <- tm_data %>%
-    filter(!is.na(PitchFamily), !is.na(mean_DRE_bat), !is.na(PitcherThrows)) %>%
-    group_by(Batter, PitcherThrows, PitchFamily) %>%
-    summarise(
-      n_pitches = n(),
-      n_pa = sum(is_pa, na.rm = TRUE),
-      raw_xrv = mean(mean_DRE_bat, na.rm = TRUE),
-      .groups = "drop"
-    ) %>%
-    filter(n_pitches >= 15)
-  
-  batter_perf
-}
-
-batter_xrv_features <- build_batter_xrv_features(tm_data, rolling_pa = 300)
-cat("Built xRV features for", n_distinct(batter_xrv_features$Batter), "batters\n")
-
-# ============================================================================
-# PREDICT xRV MATCHUP USING XGBOOST + PITCH SIMILARITY
-# ============================================================================
-
-predict_xrv_matchup <- function(pitcher_name, batter_name, pitch_family = NULL,
-                                 pitcher_arsenal, batter_features, xrv_model,
-                                 sec_priors, distance_threshold = 1.0) {
-  
-  # Get pitcher's arsenal
-  p_arsenal <- pitcher_arsenal %>% filter(Pitcher == pitcher_name)
-  
-  if (nrow(p_arsenal) == 0) {
-    return(list(xrv = NA, xrv_per100 = NA, n_batter_pa = 0, n_similar = 0, confidence = "low"))
-  }
-  
-  # Filter by pitch family if specified
-  if (!is.null(pitch_family)) {
-    p_arsenal <- p_arsenal %>% filter(PitchFamily == pitch_family)
-    if (nrow(p_arsenal) == 0) {
-      return(list(xrv = NA, xrv_per100 = NA, n_batter_pa = 0, n_similar = 0, confidence = "low"))
-    }
-  }
-  
-  p_hand <- p_arsenal$PitcherThrows[1]
-  
-  # Get batter's total pitch history for this hand
-  batter_pitches <- batter_pitch_performance %>%
-    filter(Batter == batter_name, PitcherThrows == p_hand)
-  
-  total_batter_pitches <- nrow(batter_pitches)
-  
-  if (total_batter_pitches < 20) {
-    # Insufficient batter data - use fallback
-    prior_xrv <- if (!is.null(pitch_family)) {
-      prior_row <- sec_priors %>% filter(PitchFamily == pitch_family)
-      if (nrow(prior_row) > 0) prior_row$prior_mean[1] else 0
-    } else {
-      mean(sec_priors$prior_mean, na.rm = TRUE)
-    }
-    
+  if (nrow(overall_data) == 0) {
     return(list(
-      xrv = prior_xrv,
-      xrv_per100 = prior_xrv * 100,
-      n_batter_pa = total_batter_pitches,
-      n_similar = 0,
-      confidence = "very_low"
+      overall_xrv = NA,
+      fb_xrv = NA,
+      bb_xrv = NA,
+      os_xrv = NA,
+      n_pitches = 0,
+      whiff_pct = NA,
+      chase_pct = NA,
+      pitcher_hand = NA
     ))
   }
   
-  # For each pitch in arsenal, get batter's similar pitch performance and predict xRV
-  predictions <- list()
-  total_similar <- 0
-  total_usage <- 0
-  
-  for (i in 1:nrow(p_arsenal)) {
-    pt <- p_arsenal$PitchFamily[i]
-    usage <- p_arsenal$usage_pct[i]
-    
-    # Calculate batter's performance against pitches similar to this one
-    similar_perf <- calculate_batter_similar_pitch_performance(
-      batter_name, p_hand,
-      p_arsenal$RelSpeed[i],
-      p_arsenal$InducedVertBreak[i],
-      p_arsenal$HorzBreak[i],
-      ifelse(is.na(p_arsenal$SpinRate[i]), 2200, p_arsenal$SpinRate[i]),
-      ifelse(is.na(p_arsenal$RelHeight[i]), 6, p_arsenal$RelHeight[i]),
-      ifelse(is.na(p_arsenal$RelSide[i]), 0, p_arsenal$RelSide[i]),
-      distance_threshold
-    )
-    
-    total_similar <- total_similar + similar_perf$n_similar
-    
-    # If we have the XGBoost model and batter similarity data, use it for prediction
-    if (!is.null(xrv_model) && !is.null(xrv_model$model) && 
-        !is.na(similar_perf$xrv_similar) && similar_perf$n_similar >= 5) {
-      
-      # Build feature vector for prediction
-      features <- data.frame(
-        RelSpeed = p_arsenal$RelSpeed[i],
-        InducedVertBreak = p_arsenal$InducedVertBreak[i],
-        HorzBreak = p_arsenal$HorzBreak[i],
-        SpinRate = ifelse(is.na(p_arsenal$SpinRate[i]), 2200, p_arsenal$SpinRate[i]),
-        RelHeight = ifelse(is.na(p_arsenal$RelHeight[i]), 6, p_arsenal$RelHeight[i]),
-        RelSide = ifelse(is.na(p_arsenal$RelSide[i]), 0, p_arsenal$RelSide[i]),
-        mean_DRE_pit = ifelse(is.na(p_arsenal$mean_DRE_pit[i]), 0, p_arsenal$mean_DRE_pit[i]),
-        batter_xrv_vs_similar = similar_perf$xrv_similar,
-        batter_n_similar = similar_perf$n_similar,
-        batter_whiff_vs_similar = ifelse(is.na(similar_perf$whiff_rate), 0.25, similar_perf$whiff_rate),
-        batter_chase_vs_similar = ifelse(is.na(similar_perf$chase_rate), 0.28, similar_perf$chase_rate)
-      )
-      
-      features[is.na(features)] <- 0
-      X_pred <- as.matrix(features)
-      pred_xrv <- predict(xrv_model$model, X_pred)[1]
-      
-    } else if (!is.na(similar_perf$xrv_similar) && similar_perf$n_similar >= 5) {
-      # Fallback: use batter's raw similar pitch performance with light shrinkage
-      k <- 30
-      shrinkage <- similar_perf$n_similar / (similar_perf$n_similar + k)
-      pred_xrv <- shrinkage * similar_perf$xrv_similar + (1 - shrinkage) * 0
-      
-    } else {
-      # No similar pitch data - use neutral
-      pred_xrv <- 0
-    }
-    
-    predictions[[pt]] <- list(xrv = pred_xrv, usage = usage, n_similar = similar_perf$n_similar)
-    total_usage <- total_usage + usage
-  }
-  
-  # Calculate weighted xRV across arsenal
-  if (total_usage > 0 && length(predictions) > 0) {
-    weighted_xrv <- sum(sapply(names(predictions), function(pt) {
-      pred <- predictions[[pt]]
-      if (pred$n_similar >= 5) {
-        pred$xrv * (pred$usage^1.5)
-      } else {
-        0
-      }
-    }))
-    
-    total_weight <- sum(sapply(names(predictions), function(pt) {
-      pred <- predictions[[pt]]
-      if (pred$n_similar >= 5) pred$usage^1.5 else 0
-    }))
-    
-    if (total_weight > 0) {
-      weighted_xrv <- weighted_xrv / total_weight
-    } else {
-      weighted_xrv <- 0
-    }
-  } else {
-    weighted_xrv <- 0
-  }
-  
-  # Confidence based on total similar pitches found
-  confidence <- case_when(
-    total_similar >= 100 ~ "high",
-    total_similar >= 50 ~ "medium",
-    total_similar >= 20 ~ "low",
-    TRUE ~ "very_low"
-  )
+  # Get pitch family specific xRV
+  fb_row <- family_data %>% filter(PitchFamily == "FB")
+  bb_row <- family_data %>% filter(PitchFamily == "BB")
+  os_row <- family_data %>% filter(PitchFamily == "OS")
   
   list(
-    xrv = weighted_xrv,
-    xrv_per100 = weighted_xrv * 100,
-    n_batter_pa = total_batter_pitches,
-    n_similar = total_similar,
-    confidence = confidence
+    overall_xrv = overall_data$xrv_per100[1],
+    fb_xrv = if(nrow(fb_row) > 0) fb_row$xrv_per100[1] else NA,
+    bb_xrv = if(nrow(bb_row) > 0) bb_row$xrv_per100[1] else NA,
+    os_xrv = if(nrow(os_row) > 0) os_row$xrv_per100[1] else NA,
+    n_pitches = overall_data$n_pitches[1],
+    whiff_pct = overall_data$whiff_pct[1],
+    chase_pct = overall_data$chase_pct[1],
+    pitcher_hand = overall_data$PitcherThrows[1]
   )
 }
 
-# Calculate full matchup xRV (overall + by pitch group)
-calculate_xrv_matchup <- function(pitcher_name, batter_name, 
-                                   pitcher_arsenal = pitcher_arsenal,
-                                   batter_features = batter_xrv_features,
-                                   xrv_model = xrv_model_data,
-                                   sec_priors = sec_priors,
-                                   distance_threshold = 1.0) {
+# Function to get pitcher stats for all batter sides (for matrix display)
+get_pitcher_matrix_stats <- function(pitcher_name) {
+  vs_lhb <- get_pitcher_sec_stats(pitcher_name, "Left")
+  vs_rhb <- get_pitcher_sec_stats(pitcher_name, "Right")
   
-  # Overall xRV prediction
-  overall <- predict_xrv_matchup(pitcher_name, batter_name, NULL,
-                                  pitcher_arsenal, batter_features, xrv_model, sec_priors,
-                                  distance_threshold)
-  
-  # By pitch group
-  fb_result <- predict_xrv_matchup(pitcher_name, batter_name, "FB",
-                                    pitcher_arsenal, batter_features, xrv_model, sec_priors,
-                                    distance_threshold)
-  bb_result <- predict_xrv_matchup(pitcher_name, batter_name, "BB",
-                                    pitcher_arsenal, batter_features, xrv_model, sec_priors,
-                                    distance_threshold)
-  os_result <- predict_xrv_matchup(pitcher_name, batter_name, "OS",
-                                    pitcher_arsenal, batter_features, xrv_model, sec_priors,
-                                    distance_threshold)
+  # Get pitcher hand
+  p_hand <- pitcher_arsenal %>% 
+    filter(Pitcher == pitcher_name) %>% 
+    pull(PitcherThrows) %>% 
+    unique() %>% 
+    first()
   
   list(
-    overall_xrv = overall$xrv_per100,
-    fb_xrv = fb_result$xrv_per100,
-    bb_xrv = bb_result$xrv_per100,
-    os_xrv = os_result$xrv_per100,
-    confidence = overall$confidence,
-    n_pa = overall$n_batter_pa,
-    n_similar = overall$n_similar
+    pitcher_hand = if(!is.na(p_hand)) p_hand else "Unknown",
+    vs_lhb = vs_lhb,
+    vs_rhb = vs_rhb
   )
 }
 
@@ -2567,38 +2268,46 @@ app_ui <- fluidPage(
         column(9, uiOutput("hitter_detail_panel")))
     ),
     
-    # ===== xRV MATCHUP MATRIX TAB =====
+    # ===== xRV MATCHUP MATRIX TAB (PITCHER-CENTRIC) =====
     tabPanel("xRV Matchup Matrix",
       div(class = "stats-header", 
-          h3("xRV Matchup Predictions"), 
-          p("XGBoost predictive model combining pitcher effectiveness with batter's performance against similar pitches (Euclidean distance ≤ 1.0)")),
+          h3("Pitcher-Centric xRV Matrix"), 
+          p("Pitcher xRV vs SEC hitters by batter hand and pitch family. Add hitter names and notes manually.")),
       
       fluidRow(
         column(12,
           div(class = "chart-box", style = "margin-top: 15px;",
-            div(class = "chart-box-title", "Pitcher vs Hitter xRV Matchup Matrix"),
+            div(class = "chart-box-title", "Pitcher xRV vs Batter Hand (SEC Data)"),
             fluidRow(
-              column(3,
+              column(4,
                 selectizeInput("xrv_pitchers", "Select Pitchers:", choices = NULL, multiple = TRUE,
-                               options = list(placeholder = "Search pitchers...", maxItems = 10))),
-              column(3,
-                selectizeInput("xrv_hitters", "Select Hitters:", choices = NULL, multiple = TRUE,
-                               options = list(placeholder = "Search hitters...", maxItems = 12))),
-              column(3,
-                actionButton("generate_xrv_matrix", "Generate xRV Matrix", class = "btn-bronze", style = "margin-top: 25px;")),
-              column(3,
-                downloadButton("download_xrv_png", "Download as PNG", class = "btn-bronze", style = "margin-top: 25px;"))
+                               options = list(placeholder = "Search pitchers...", maxItems = 12))),
+              column(4,
+                div(style = "margin-top: 5px;",
+                  tags$label("Hitter Lineup (one per line, format: Name,Hand)"),
+                  tags$textarea(id = "hitter_lineup_input", 
+                               rows = 6, 
+                               style = "width: 100%; font-size: 11px; font-family: monospace;",
+                               placeholder = "Hitter Name, L\nHitter Name, R\nHitter Name, S"))),
+              column(4,
+                div(style = "margin-top: 25px;",
+                  actionButton("generate_xrv_matrix", "Generate Matrix", class = "btn-bronze", style = "width: 100%; margin-bottom: 10px;"),
+                  downloadButton("download_xrv_png", "Download as PNG", class = "btn-bronze", style = "width: 100%;")))
             ),
             div(style = "margin-top: 10px; padding: 10px; background: #f5f5f5; border-radius: 5px;",
               div(style = "font-size: 12px; color: #333;",
-                tags$b("xRV Interpretation:"), " Positive (+) = Hitter Advantage, Negative (-) = Pitcher Advantage"),
+                tags$b("xRV Interpretation (Pitcher Perspective):"), " Negative (-) = Pitcher Advantage, Positive (+) = Hitter Advantage"),
               div(style = "display: flex; gap: 15px; margin-top: 5px; font-size: 11px;",
-                tags$span(style = "background: #FFCDD2; padding: 2px 8px; border-radius: 3px;", "+1.5+ Strong Hitter"),
-                tags$span(style = "background: #FFE0B2; padding: 2px 8px; border-radius: 3px;", "+0.5 to +1.5 Hitter"),
+                tags$span(style = "background: #C8E6C9; padding: 2px 8px; border-radius: 3px;", "-1.5+ Strong P"),
+                tags$span(style = "background: #DCEDC8; padding: 2px 8px; border-radius: 3px;", "-0.5 to -1.5 Pitcher"),
                 tags$span(style = "background: #FFF9C4; padding: 2px 8px; border-radius: 3px;", "-0.5 to +0.5 Neutral"),
-                tags$span(style = "background: #DCEDC8; padding: 2px 8px; border-radius: 3px;", "-1.5 to -0.5 Pitcher"),
-                tags$span(style = "background: #C8E6C9; padding: 2px 8px; border-radius: 3px;", "-1.5+ Strong Pitcher")
-              )
+                tags$span(style = "background: #FFE0B2; padding: 2px 8px; border-radius: 3px;", "+0.5 to +1.5 Hitter"),
+                tags$span(style = "background: #FFCDD2; padding: 2px 8px; border-radius: 3px;", "+1.5+ Strong H")
+              ),
+              div(style = "margin-top: 8px; font-size: 11px; color: #666;",
+                tags$b("Hitter Input:"), " Enter lineup with hand (L=Left, R=Right, S=Switch). For switch hitters, matrix shows vs opposite hand pitcher.",
+                tags$br(),
+                tags$b("Note:"), " xRV data is pitcher performance vs SEC hitters by batter hand. Use notes for hitter-specific adjustments.")
             ),
             hr(),
             div(id = "xrv_matrix_container", style = "overflow-x: auto;", 
@@ -2649,9 +2358,8 @@ server <- function(input, output, session) {
   observeEvent(logged_in(), {
     if (logged_in()) {
       updateSelectizeInput(session, "scout_hitters", choices = all_hitters, server = TRUE) 
-      # xRV Matchup Matrix inputs
+      # xRV Matchup Matrix inputs (pitcher-centric - hitters entered manually)
       updateSelectizeInput(session, "xrv_pitchers", choices = all_pitchers, server = TRUE)
-      updateSelectizeInput(session, "xrv_hitters", choices = all_hitters, server = TRUE)
     }
   }, ignoreInit = TRUE)
   
@@ -3743,49 +3451,130 @@ output$download_scout_pdf <- downloadHandler(
   )
                                                 
   # ============================================================================
-  # xRV MATCHUP MATRIX SERVER LOGIC
+  # xRV MATCHUP MATRIX SERVER LOGIC (PITCHER-CENTRIC)
   # ============================================================================
   
-  # Generate xRV Matchup Matrix
-  observeEvent(input$generate_xrv_matrix, {
-    req(input$xrv_pitchers, input$xrv_hitters)
-    
-    pitchers <- input$xrv_pitchers
-    hitters <- input$xrv_hitters
-    
-    if (length(pitchers) == 0 || length(hitters) == 0) {
-      showNotification("Please select at least one pitcher and one hitter", type = "warning")
-      return()
+  # Helper to parse hitter lineup input
+  parse_hitter_lineup <- function(input_text) {
+    if (is.null(input_text) || trimws(input_text) == "") {
+      return(NULL)
     }
     
-    # Calculate xRV matchup matrix with pitch group breakdown
-    results_list <- list()
+    lines <- strsplit(input_text, "\n")[[1]]
+    lines <- trimws(lines)
+    lines <- lines[lines != ""]
     
-    withProgress(message = "Calculating xRV predictions...", value = 0, {
-      total <- length(pitchers) * length(hitters)
-      counter <- 0
-      
-      for (p_idx in seq_along(pitchers)) {
-        for (h_idx in seq_along(hitters)) {
-          pitcher <- pitchers[p_idx]
-          hitter <- hitters[h_idx]
-          key <- paste0(pitcher, "||", hitter)
-          
-          # Calculate xRV matchup
-          matchup_result <- calculate_xrv_matchup(
-            pitcher, hitter,
-            pitcher_arsenal, batter_xrv_features, xrv_model_data, sec_priors
-          )
-          
-          results_list[[key]] <- matchup_result
-          counter <- counter + 1
-          incProgress(1/total)
-        }
+    hitters <- lapply(lines, function(line) {
+      parts <- strsplit(line, ",")[[1]]
+      if (length(parts) >= 2) {
+        name <- trimws(parts[1])
+        hand <- toupper(trimws(parts[2]))
+        # Normalize hand: L, R, or S (switch)
+        if (hand %in% c("L", "LEFT")) hand <- "L"
+        else if (hand %in% c("R", "RIGHT")) hand <- "R"
+        else if (hand %in% c("S", "SWITCH", "B", "BOTH")) hand <- "S"
+        else hand <- "R"  # Default to R if unclear
+        list(name = name, hand = hand)
+      } else {
+        # Just a name, default to R
+        list(name = trimws(line), hand = "R")
       }
     })
     
-    xrv_matrix_data(list(results = results_list, pitchers = pitchers, hitters = hitters))
-    showNotification("xRV Matrix generated successfully!", type = "message")
+    hitters
+  }
+  
+  # Generate xRV Matchup Matrix (PITCHER-CENTRIC - FAST!)
+  observeEvent(input$generate_xrv_matrix, {
+    req(input$xrv_pitchers)
+    
+    pitchers <- input$xrv_pitchers
+    hitter_input <- input$hitter_lineup_input
+    
+    if (length(pitchers) == 0) {
+      showNotification("Please select at least one pitcher", type = "warning")
+      return()
+    }
+    
+    # Parse hitter lineup
+    hitters <- parse_hitter_lineup(hitter_input)
+    
+    if (is.null(hitters) || length(hitters) == 0) {
+      # No hitters specified - just show pitcher stats vs L and R
+      hitters <- list(
+        list(name = "vs LHB", hand = "L"),
+        list(name = "vs RHB", hand = "R")
+      )
+    }
+    
+    # Build results - FAST lookup from pre-calculated data
+    results_list <- list()
+    
+    withProgress(message = "Building pitcher matrix...", value = 0, {
+      total <- length(pitchers)
+      
+      for (p_idx in seq_along(pitchers)) {
+        pitcher <- pitchers[p_idx]
+        
+        # Get pitcher stats (already calculated at startup)
+        pitcher_stats <- get_pitcher_matrix_stats(pitcher)
+        
+        for (h_idx in seq_along(hitters)) {
+          h_info <- hitters[[h_idx]]
+          h_name <- h_info$name
+          h_hand <- h_info$hand
+          
+          key <- paste0(pitcher, "||", h_name)
+          
+          # Determine which batter side to use
+          if (h_hand == "S") {
+            # Switch hitter - use opposite of pitcher hand
+            if (pitcher_stats$pitcher_hand == "Right") {
+              batter_side <- "Left"
+            } else {
+              batter_side <- "Right"
+            }
+          } else if (h_hand == "L") {
+            batter_side <- "Left"
+          } else {
+            batter_side <- "Right"
+          }
+          
+          # Get the stats for this matchup
+          if (batter_side == "Left") {
+            stats <- pitcher_stats$vs_lhb
+          } else {
+            stats <- pitcher_stats$vs_rhb
+          }
+          
+          results_list[[key]] <- list(
+            overall_xrv = stats$overall_xrv,
+            fb_xrv = stats$fb_xrv,
+            bb_xrv = stats$bb_xrv,
+            os_xrv = stats$os_xrv,
+            n_pitches = stats$n_pitches,
+            whiff_pct = stats$whiff_pct,
+            chase_pct = stats$chase_pct,
+            batter_side = batter_side,
+            hitter_hand = h_hand
+          )
+        }
+        
+        incProgress(1/total)
+      }
+    })
+    
+    # Store hitter info with names
+    hitter_names <- sapply(hitters, function(h) h$name)
+    hitter_hands <- sapply(hitters, function(h) h$hand)
+    
+    xrv_matrix_data(list(
+      results = results_list, 
+      pitchers = pitchers, 
+      hitters = hitter_names,
+      hitter_hands = hitter_hands
+    ))
+    showNotification("Matrix generated!", type = "message")
   })
   
   # Handle note updates from matrix cells
@@ -3798,19 +3587,20 @@ output$download_scout_pdf <- downloadHandler(
     }
   })
   
-  # Render xRV Matchup Matrix
+  # Render xRV Matchup Matrix (PITCHER-CENTRIC)
   output$xrv_matrix_output <- renderUI({
     data <- xrv_matrix_data()
     if (is.null(data)) {
       return(div(style = "text-align: center; padding: 40px; color: #666;",
-                 p("Select pitchers and hitters, then click 'Generate xRV Matrix' to see predicted matchup values."),
+                 p("Select pitchers and enter hitter lineup, then click 'Generate Matrix'."),
                  p(style = "font-size: 12px; margin-top: 10px;", 
-                   "XGBoost model predicts xRV using pitcher's pitch characteristics + batter's actual performance against similar pitches (Euclidean distance ≤ 1.0).")))
+                   "Shows pitcher xRV vs SEC hitters by batter hand. Enter hitters as 'Name, L' or 'Name, R' (or S for switch).")))
     }
     
     results <- data$results
     pitchers <- data$pitchers
     hitters <- data$hitters
+    hitter_hands <- data$hitter_hands
     current_notes <- xrv_notes()
     
     # Build HTML table with pitchers on top, hitters on side
@@ -3820,7 +3610,7 @@ output$download_scout_pdf <- downloadHandler(
       p_hand <- pitcher_arsenal %>% filter(Pitcher == p) %>% pull(PitcherThrows) %>% unique() %>% first()
       p_hand_label <- if(!is.na(p_hand)) paste0(" (", substr(p_hand, 1, 1), "HP)") else ""
       
-      tags$th(style = "padding: 10px; background: #006F71; color: white; font-size: 11px; min-width: 140px; text-align: center; vertical-align: bottom;", 
+      tags$th(style = "padding: 10px; background: #006F71; color: white; font-size: 11px; min-width: 150px; text-align: center; vertical-align: bottom;", 
               div(style = "font-weight: bold;", substr(p, 1, 18)),
               div(style = "font-size: 9px; font-weight: normal;", p_hand_label))
     })
@@ -3828,6 +3618,7 @@ output$download_scout_pdf <- downloadHandler(
     # Table rows - one per hitter
     table_rows <- lapply(seq_along(hitters), function(h_idx) {
       h_name <- hitters[h_idx]
+      h_hand <- if(h_idx <= length(hitter_hands)) hitter_hands[h_idx] else "R"
       
       # Create cells for each pitcher
       matchup_cells <- lapply(seq_along(pitchers), function(p_idx) {
@@ -3838,10 +3629,16 @@ output$download_scout_pdf <- downloadHandler(
         
         if (is.null(matchup) || is.na(matchup$overall_xrv)) {
           return(tags$td(style = "padding: 8px; text-align: center; background: #E0E0E0; vertical-align: top;",
-                        div(style = "font-size: 12px; color: #666;", "N/A")))
+                        div(style = "font-size: 12px; color: #666;", "N/A"),
+                        tags$textarea(
+                          class = "xrv-note-input",
+                          style = "width: 100%; height: 40px; font-size: 9px; border: 1px solid #ccc; border-radius: 3px; padding: 2px; resize: none; margin-top: 5px;",
+                          placeholder = "Hitter notes...",
+                          onchange = sprintf("Shiny.setInputValue('xrv_note_update', {key: '%s', value: this.value}, {priority: 'event'});", key)
+                        )))
         }
         
-        # Colors based on xRV
+        # Colors based on xRV (from pitcher perspective - negative is good for pitcher)
         overall_bg <- get_xrv_color(matchup$overall_xrv)
         overall_text <- get_xrv_text_color(matchup$overall_xrv)
         
@@ -3855,14 +3652,18 @@ output$download_scout_pdf <- downloadHandler(
           sprintf("%+.1f", val)
         }
         
+        format_pct <- function(val) {
+          if (is.na(val)) return("-")
+          sprintf("%.0f%%", val)
+        }
+        
         # Get existing note
-        note_key <- gsub("[^A-Za-z0-9]", "_", key)
         existing_note <- if (!is.null(current_notes[[key]])) current_notes[[key]] else ""
         
         # Cell content
         tags$td(style = paste0("padding: 6px; vertical-align: top; background: ", overall_bg, "; border: 1px solid #ddd;"),
           # Overall xRV (prominent)
-          div(style = paste0("text-align: center; font-size: 18px; font-weight: bold; color: ", overall_text, "; margin-bottom: 4px;"),
+          div(style = paste0("text-align: center; font-size: 20px; font-weight: bold; color: ", overall_text, "; margin-bottom: 4px;"),
               format_xrv(matchup$overall_xrv)),
           
           # Pitch group breakdown
@@ -3875,26 +3676,32 @@ output$download_scout_pdf <- downloadHandler(
                      "BB: ", format_xrv(matchup$bb_xrv))
           ),
           
-          # Confidence indicator with similar pitch count
+          # Sample size and rates
           div(style = "text-align: center; font-size: 9px; color: #666; margin-bottom: 3px;",
-              paste0("(", matchup$confidence, ", n=", ifelse(is.null(matchup$n_similar), "?", matchup$n_similar), ")")),
+              paste0("n=", matchup$n_pitches, " | W:", format_pct(matchup$whiff_pct), " Ch:", format_pct(matchup$chase_pct))),
           
-          # Notes input
+          # Side indicator
+          div(style = "text-align: center; font-size: 8px; color: #888; margin-bottom: 3px;",
+              paste0("(vs ", matchup$batter_side, ")")),
+          
+          # Notes input for hitter-specific info
           tags$textarea(
-            id = paste0("note_", note_key),
             class = "xrv-note-input",
-            style = "width: 100%; height: 35px; font-size: 9px; border: 1px solid #ccc; border-radius: 3px; padding: 2px; resize: none;",
-            placeholder = "Notes...",
+            style = "width: 100%; height: 40px; font-size: 9px; border: 1px solid #ccc; border-radius: 3px; padding: 2px; resize: none;",
+            placeholder = "Hitter adjustments...",
             onchange = sprintf("Shiny.setInputValue('xrv_note_update', {key: '%s', value: this.value}, {priority: 'event'});", key),
             existing_note
           )
         )
       })
       
-      # Hitter row
+      # Hitter row with hand indicator
+      hand_label <- switch(h_hand, "L" = "(L)", "R" = "(R)", "S" = "(S)", "(R)")
+      
       tags$tr(
-        tags$td(style = "padding: 8px; background: #f5f5f5; font-weight: bold; font-size: 11px; vertical-align: middle; min-width: 120px;", 
-                substr(h_name, 1, 20)),
+        tags$td(style = "padding: 8px; background: #f5f5f5; font-weight: bold; font-size: 11px; vertical-align: middle; min-width: 130px;", 
+                div(substr(h_name, 1, 18)),
+                div(style = "font-size: 9px; color: #666; font-weight: normal;", hand_label)),
         matchup_cells
       )
     })
@@ -3903,10 +3710,12 @@ output$download_scout_pdf <- downloadHandler(
     legend_row <- tags$tr(
       tags$td(colspan = length(pitchers) + 1, style = "padding: 10px; background: #fafafa; font-size: 10px; color: #666;",
         div(style = "display: flex; justify-content: center; gap: 20px; flex-wrap: wrap;",
-          tags$span(tags$b("xRV"), " = Expected Run Value per 100 pitches"),
+          tags$span(tags$b("xRV"), " = Pitcher Run Value/100 vs SEC (neg = pitcher advantage)"),
           tags$span(tags$b("FB"), " = Fastballs"),
-          tags$span(tags$b("OS"), " = Offspeed (CH, Split)"),
-          tags$span(tags$b("BB"), " = Breaking Balls (SL, CB, CUT)")
+          tags$span(tags$b("OS"), " = Offspeed"),
+          tags$span(tags$b("BB"), " = Breaking"),
+          tags$span(tags$b("W"), " = Whiff%"),
+          tags$span(tags$b("Ch"), " = Chase%")
         )
       )
     )
@@ -3929,10 +3738,10 @@ output$download_scout_pdf <- downloadHandler(
     )
   })
   
-  # Download xRV Matrix as PNG
+  # Download xRV Matrix as PNG (PITCHER-CENTRIC)
   output$download_xrv_png <- downloadHandler(
     filename = function() {
-      paste0("xRV_Matchup_Matrix_", format(Sys.Date(), "%Y%m%d"), ".png")
+      paste0("Pitcher_xRV_Matrix_", format(Sys.Date(), "%Y%m%d"), ".png")
     },
     content = function(file) {
       data <- xrv_matrix_data()
@@ -3948,16 +3757,17 @@ output$download_scout_pdf <- downloadHandler(
       results <- data$results
       pitchers <- data$pitchers
       hitters <- data$hitters
+      hitter_hands <- if(!is.null(data$hitter_hands)) data$hitter_hands else rep("R", length(hitters))
       current_notes <- xrv_notes()
       
       # Calculate dimensions
       n_pitchers <- length(pitchers)
       n_hitters <- length(hitters)
       
-      cell_width <- 120
-      cell_height <- 80
+      cell_width <- 130
+      cell_height <- 85
       header_height <- 50
-      row_label_width <- 150
+      row_label_width <- 160
       
       img_width <- row_label_width + n_pitchers * cell_width + 40
       img_height <- header_height + n_hitters * cell_height + 80
@@ -3967,7 +3777,7 @@ output$download_scout_pdf <- downloadHandler(
       grid::grid.newpage()
       
       # Title
-      grid::grid.text("xRV Matchup Predictions", x = 0.5, y = 0.97, 
+      grid::grid.text("Pitcher xRV Matrix (vs SEC by Batter Hand)", x = 0.5, y = 0.97, 
                      gp = grid::gpar(fontsize = 14, fontface = "bold", col = "#006F71"))
       grid::grid.text(paste0("Generated: ", Sys.Date()), x = 0.5, y = 0.94,
                      gp = grid::gpar(fontsize = 9, col = "gray50"))
@@ -3981,9 +3791,13 @@ output$download_scout_pdf <- downloadHandler(
         x_pos <- (row_label_width + (p_idx - 0.5) * cell_width) / img_width
         y_pos <- plot_top
         
+        # Get pitcher hand
+        p_hand <- pitcher_arsenal %>% filter(Pitcher == pitchers[p_idx]) %>% pull(PitcherThrows) %>% unique() %>% first()
+        p_label <- if(!is.na(p_hand)) paste0(substr(pitchers[p_idx], 1, 14), " (", substr(p_hand, 1, 1), ")") else substr(pitchers[p_idx], 1, 15)
+        
         grid::grid.rect(x = x_pos, y = y_pos, width = (cell_width - 2) / img_width, height = 0.04,
                        gp = grid::gpar(fill = "#006F71", col = "white"))
-        grid::grid.text(substr(pitchers[p_idx], 1, 15), x = x_pos, y = y_pos,
+        grid::grid.text(p_label, x = x_pos, y = y_pos,
                        gp = grid::gpar(fontsize = 8, col = "white", fontface = "bold"))
       }
       
@@ -3991,19 +3805,20 @@ output$download_scout_pdf <- downloadHandler(
       grid::grid.rect(x = (row_label_width / 2) / img_width, y = plot_top, 
                      width = (row_label_width - 4) / img_width, height = 0.04,
                      gp = grid::gpar(fill = "#37474F", col = "white"))
-      grid::grid.text("Hitter", x = (row_label_width / 2) / img_width, y = plot_top,
+      grid::grid.text("Hitter (Hand)", x = (row_label_width / 2) / img_width, y = plot_top,
                      gp = grid::gpar(fontsize = 9, col = "white", fontface = "bold"))
       
       # Draw data rows
       for (h_idx in seq_along(hitters)) {
         hitter <- hitters[h_idx]
+        h_hand <- if(h_idx <= length(hitter_hands)) hitter_hands[h_idx] else "R"
         row_y <- plot_top - 0.04 - (h_idx - 0.5) * (cell_height / img_height)
         
-        # Hitter name cell
+        # Hitter name cell with hand
         grid::grid.rect(x = (row_label_width / 2) / img_width, y = row_y,
                        width = (row_label_width - 4) / img_width, height = (cell_height - 2) / img_height,
                        gp = grid::gpar(fill = "#f5f5f5", col = "#ddd"))
-        grid::grid.text(substr(hitter, 1, 20), x = (row_label_width / 2) / img_width, y = row_y,
+        grid::grid.text(paste0(substr(hitter, 1, 18), " (", h_hand, ")"), x = (row_label_width / 2) / img_width, y = row_y,
                        gp = grid::gpar(fontsize = 8, fontface = "bold"))
         
         # Data cells
@@ -4029,7 +3844,7 @@ output$download_scout_pdf <- downloadHandler(
                            gp = grid::gpar(fill = bg_col, col = "#ddd"))
             
             # Overall xRV
-            grid::grid.text(sprintf("%+.1f", matchup$overall_xrv), x = x_pos, y = row_y + 0.02,
+            grid::grid.text(sprintf("%+.1f", matchup$overall_xrv), x = x_pos, y = row_y + 0.025,
                            gp = grid::gpar(fontsize = 14, fontface = "bold", col = text_col))
             
             # Pitch breakdown
@@ -4037,13 +3852,18 @@ output$download_scout_pdf <- downloadHandler(
             breakdown_text <- paste0("FB:", format_xrv_short(matchup$fb_xrv), 
                                     " OS:", format_xrv_short(matchup$os_xrv),
                                     " BB:", format_xrv_short(matchup$bb_xrv))
-            grid::grid.text(breakdown_text, x = x_pos, y = row_y - 0.015,
+            grid::grid.text(breakdown_text, x = x_pos, y = row_y - 0.005,
                            gp = grid::gpar(fontsize = 7, col = "gray30"))
+            
+            # n and rates
+            n_text <- paste0("n=", matchup$n_pitches)
+            grid::grid.text(n_text, x = x_pos, y = row_y - 0.025,
+                           gp = grid::gpar(fontsize = 6, col = "gray50"))
             
             # Notes if present
             note <- current_notes[[key]]
             if (!is.null(note) && nchar(note) > 0) {
-              grid::grid.text(substr(note, 1, 25), x = x_pos, y = row_y - 0.035,
+              grid::grid.text(substr(note, 1, 20), x = x_pos, y = row_y - 0.04,
                              gp = grid::gpar(fontsize = 6, col = "gray50", fontface = "italic"))
             }
           }
@@ -4052,7 +3872,7 @@ output$download_scout_pdf <- downloadHandler(
       
       # Legend
       legend_y <- 0.03
-      grid::grid.text("xRV = Expected Run Value/100 pitches  |  (+) Hitter Advantage  |  (-) Pitcher Advantage  |  FB=Fastball  OS=Offspeed  BB=Breaking",
+      grid::grid.text("xRV = Pitcher Run Value/100 vs SEC  |  (-) Pitcher Advantage  |  (+) Hitter Advantage  |  FB=Fastball  OS=Offspeed  BB=Breaking",
                      x = 0.5, y = legend_y, gp = grid::gpar(fontsize = 8, col = "gray50"))
       
       dev.off()
