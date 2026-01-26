@@ -644,115 +644,154 @@ cat("SEC priors calculated for", nrow(sec_priors), "pitch families (fallback onl
 # Calculates batter's performance against pitches similar to a target profile
 # Uses Euclidean distance <= 1.0 in standardized pitch characteristic space
 
-calculate_batter_similar_pitch_performance <- function(batter_name, pitcher_hand, 
-                                                        target_velo, target_ivb, target_hb,
-                                                        target_spin, target_relh, target_rels,
-                                                        distance_threshold = 1.0) {
-  # Get batter's pitch history for this pitcher hand
-  batter_pitches <- batter_pitch_performance %>%
+# Fast version using pre-computed bins (for prediction time)
+calculate_batter_similar_pitch_performance_fast <- function(batter_name, pitcher_hand, 
+                                                             target_velo, target_ivb, target_hb,
+                                                             target_spin, target_relh, target_rels,
+                                                             distance_threshold = 1.0) {
+  # Standardize and bin the target pitch
+  velo_z <- (target_velo - feature_means$RelSpeed) / feature_sds$RelSpeed
+  ivb_z <- (target_ivb - feature_means$InducedVertBreak) / feature_sds$InducedVertBreak
+  hb_z <- (target_hb - feature_means$HorzBreak) / feature_sds$HorzBreak
+  
+  velo_bin <- round(velo_z * 2) / 2
+  ivb_bin <- round(ivb_z * 2) / 2
+  hb_bin <- round(hb_z * 2) / 2
+  
+  # Look up pre-computed binned stats
+  binned_match <- batter_binned_stats %>%
+    filter(Batter == batter_name, PitcherThrows == pitcher_hand,
+           velo_bin == !!velo_bin, ivb_bin == !!ivb_bin, hb_bin == !!hb_bin)
+  
+  if (nrow(binned_match) > 0) {
+    return(list(
+      xrv_similar = binned_match$batter_xrv_binned[1],
+      n_similar = binned_match$batter_n_binned[1],
+      whiff_rate = binned_match$batter_whiff_binned[1],
+      chase_rate = binned_match$batter_chase_binned[1]
+    ))
+  }
+  
+  # Fallback: look for nearby bins (expand search)
+  nearby_bins <- batter_binned_stats %>%
+    filter(Batter == batter_name, PitcherThrows == pitcher_hand,
+           abs(velo_bin - !!velo_bin) <= 0.5,
+           abs(ivb_bin - !!ivb_bin) <= 0.5,
+           abs(hb_bin - !!hb_bin) <= 0.5)
+  
+  if (nrow(nearby_bins) > 0) {
+    # Weighted average by sample size
+    total_n <- sum(nearby_bins$batter_n_binned)
+    return(list(
+      xrv_similar = sum(nearby_bins$batter_xrv_binned * nearby_bins$batter_n_binned) / total_n,
+      n_similar = total_n,
+      whiff_rate = sum(nearby_bins$batter_whiff_binned * nearby_bins$batter_n_binned) / total_n,
+      chase_rate = sum(nearby_bins$batter_chase_binned * nearby_bins$batter_n_binned) / total_n
+    ))
+  }
+  
+  # Final fallback: use overall batter stats
+  overall_match <- batter_overall_stats %>%
     filter(Batter == batter_name, PitcherThrows == pitcher_hand)
   
-  if (nrow(batter_pitches) < 10) {
-    return(list(xrv_similar = NA, n_similar = 0, whiff_rate = NA, chase_rate = NA))
+  if (nrow(overall_match) > 0) {
+    return(list(
+      xrv_similar = overall_match$batter_xrv_overall[1],
+      n_similar = overall_match$batter_n_overall[1],
+      whiff_rate = overall_match$batter_whiff_overall[1],
+      chase_rate = overall_match$batter_chase_overall[1]
+    ))
   }
   
-  # Standardize target pitch characteristics
-  target <- list(
-    RelSpeed_z = (target_velo - feature_means$RelSpeed) / feature_sds$RelSpeed,
-    IVB_z = (target_ivb - feature_means$InducedVertBreak) / feature_sds$InducedVertBreak,
-    HB_z = (target_hb - feature_means$HorzBreak) / feature_sds$HorzBreak,
-    SpinRate_z = (target_spin - feature_means$SpinRate) / feature_sds$SpinRate,
-    RelHeight_z = (target_relh - feature_means$RelHeight) / feature_sds$RelHeight,
-    RelSide_z = (target_rels - feature_means$RelSide) / feature_sds$RelSide
-  )
-  
-  # Handle NAs in target
-  target <- lapply(target, function(x) if(is.na(x) || is.nan(x)) 0 else x)
-  
-  # Calculate Euclidean distance for each pitch batter has faced
-  batter_pitches_calc <- batter_pitches %>%
-    mutate(
-      RelSpeed_z_safe = ifelse(is.na(RelSpeed_z), 0, RelSpeed_z),
-      IVB_z_safe = ifelse(is.na(IVB_z), 0, IVB_z),
-      HB_z_safe = ifelse(is.na(HB_z), 0, HB_z),
-      SpinRate_z_safe = ifelse(is.na(SpinRate_z), 0, SpinRate_z),
-      RelHeight_z_safe = ifelse(is.na(RelHeight_z), 0, RelHeight_z),
-      RelSide_z_safe = ifelse(is.na(RelSide_z), 0, RelSide_z),
-      distance = sqrt(
-        (RelSpeed_z_safe - target$RelSpeed_z)^2 +
-          (IVB_z_safe - target$IVB_z)^2 +
-          (HB_z_safe - target$HB_z)^2 +
-          (SpinRate_z_safe - target$SpinRate_z)^2 +
-          (RelHeight_z_safe - target$RelHeight_z)^2 +
-          (RelSide_z_safe - target$RelSide_z)^2
-      )
-    )
-  
-  # Filter to similar pitches within Euclidean distance threshold
-  similar_pitches <- batter_pitches_calc %>%
-    filter(!is.na(distance), distance <= distance_threshold)
-  
-  n_similar <- nrow(similar_pitches)
-  
-  if (n_similar >= 5) {
-    xrv_similar <- mean(similar_pitches$hitter_rv, na.rm = TRUE)
-    whiff_rate <- sum(similar_pitches$WhiffIndicator, na.rm = TRUE) / 
-                  pmax(1, sum(similar_pitches$SwingIndicator, na.rm = TRUE))
-    chase_rate <- sum(similar_pitches$chase, na.rm = TRUE) / 
-                  pmax(1, sum(similar_pitches$out_of_zone, na.rm = TRUE))
-    
-    return(list(xrv_similar = xrv_similar, n_similar = n_similar, 
-                whiff_rate = whiff_rate, chase_rate = chase_rate))
-  }
-  
-  list(xrv_similar = NA, n_similar = n_similar, whiff_rate = NA, chase_rate = NA)
+  list(xrv_similar = NA, n_similar = 0, whiff_rate = NA, chase_rate = NA)
 }
 
+# Keep original function as alias for compatibility
+calculate_batter_similar_pitch_performance <- calculate_batter_similar_pitch_performance_fast
+
 # ============================================================================
-# BUILD TRAINING DATA WITH PITCH SIMILARITY FEATURES
+# PRE-COMPUTE BATTER PERFORMANCE BY PITCH PROFILE BINS (FAST)
+# ============================================================================
+# Instead of computing similarity for each training row, we pre-aggregate
+# batter stats into velocity/movement bins for fast lookup
+
+cat("Pre-computing batter performance by pitch profile bins...\n")
+
+# Create binned batter performance stats (vectorized, fast)
+batter_binned_stats <- batter_pitch_performance %>%
+  filter(!is.na(hitter_rv), !is.na(RelSpeed_z), !is.na(IVB_z), !is.na(HB_z)) %>%
+  mutate(
+    # Bin pitch characteristics (wider bins for more samples per bin)
+    velo_bin = round(RelSpeed_z * 2) / 2,  # 0.5 SD bins
+    ivb_bin = round(IVB_z * 2) / 2,
+    hb_bin = round(HB_z * 2) / 2
+  ) %>%
+  group_by(Batter, PitcherThrows, velo_bin, ivb_bin, hb_bin) %>%
+  summarise(
+    batter_xrv_binned = mean(hitter_rv, na.rm = TRUE),
+    batter_n_binned = n(),
+    batter_whiff_binned = sum(WhiffIndicator, na.rm = TRUE) / pmax(1, sum(SwingIndicator, na.rm = TRUE)),
+    batter_chase_binned = sum(chase, na.rm = TRUE) / pmax(1, sum(out_of_zone, na.rm = TRUE)),
+    .groups = "drop"
+  ) %>%
+  filter(batter_n_binned >= 3)  # Minimum samples per bin
+
+cat("Created", nrow(batter_binned_stats), "batter-bin combinations\n")
+
+# Also create overall batter stats by pitcher hand (fast fallback)
+batter_overall_stats <- batter_pitch_performance %>%
+  filter(!is.na(hitter_rv)) %>%
+  group_by(Batter, PitcherThrows) %>%
+  summarise(
+    batter_xrv_overall = mean(hitter_rv, na.rm = TRUE),
+    batter_n_overall = n(),
+    batter_whiff_overall = sum(WhiffIndicator, na.rm = TRUE) / pmax(1, sum(SwingIndicator, na.rm = TRUE)),
+    batter_chase_overall = sum(chase, na.rm = TRUE) / pmax(1, sum(out_of_zone, na.rm = TRUE)),
+    .groups = "drop"
+  ) %>%
+  filter(batter_n_overall >= 20)
+
+cat("Created overall stats for", nrow(batter_overall_stats), "batter-hand combinations\n")
+
+# ============================================================================
+# BUILD TRAINING DATA WITH PRE-COMPUTED BATTER FEATURES (FAST)
 # ============================================================================
 
-build_xrv_training_data_with_similarity <- function(tm_data, distance_threshold = 1.0) {
-  cat("Building training data with pitch similarity features...\n")
+build_xrv_training_data_fast <- function(tm_data, batter_binned, batter_overall) {
+  cat("Building training data with pre-computed batter features...\n")
   
-  # Sample pitches for training (for memory efficiency)
+  # Sample pitches for training
   train_pitches <- tm_data %>%
     filter(!is.na(PitchFamily), !is.na(mean_DRE_bat), !is.na(PitcherThrows),
            !is.na(RelSpeed), !is.na(InducedVertBreak), !is.na(HorzBreak)) %>%
-    sample_n(min(50000, n()))
+    sample_n(min(80000, n()))
   
-  # For each pitch, calculate batter's historical performance against similar pitches
-  # This is done efficiently by pre-computing batter stats
-  cat("Pre-computing batter similarity stats for", n_distinct(train_pitches$Batter), "batters...\n")
-  
-  # Pre-aggregate batter stats by pitch characteristic bins for efficiency
-  batter_stats_cache <- list()
-  
-  train_with_features <- train_pitches %>%
-    rowwise() %>%
+  # Add standardized bins to training data
+  train_pitches <- train_pitches %>%
     mutate(
-      # Calculate batter's performance against similar pitches to this one
-      similar_perf = list(calculate_batter_similar_pitch_performance(
-        Batter, PitcherThrows, RelSpeed, InducedVertBreak, HorzBreak,
-        ifelse(is.na(SpinRate), 2200, SpinRate),
-        ifelse(is.na(RelHeight), 6, RelHeight),
-        ifelse(is.na(RelSide), 0, RelSide),
-        distance_threshold
-      ))
-    ) %>%
-    ungroup() %>%
-    mutate(
-      batter_xrv_vs_similar = sapply(similar_perf, function(x) x$xrv_similar),
-      batter_n_similar = sapply(similar_perf, function(x) x$n_similar),
-      batter_whiff_vs_similar = sapply(similar_perf, function(x) x$whiff_rate),
-      batter_chase_vs_similar = sapply(similar_perf, function(x) x$chase_rate)
-    ) %>%
-    select(-similar_perf) %>%
-    # Filter to rows where we have batter similarity data
-    filter(!is.na(batter_xrv_vs_similar), batter_n_similar >= 5)
+      velo_bin = round((RelSpeed - feature_means$RelSpeed) / feature_sds$RelSpeed * 2) / 2,
+      ivb_bin = round((InducedVertBreak - feature_means$InducedVertBreak) / feature_sds$InducedVertBreak * 2) / 2,
+      hb_bin = round((HorzBreak - feature_means$HorzBreak) / feature_sds$HorzBreak * 2) / 2
+    )
   
-  cat("Built training data with", nrow(train_with_features), "samples\n")
-  train_with_features
+  # Join with pre-computed batter binned stats (fast vectorized join)
+  train_with_bins <- train_pitches %>%
+    left_join(batter_binned, by = c("Batter", "PitcherThrows", "velo_bin", "ivb_bin", "hb_bin"))
+  
+  # For rows without binned match, use overall batter stats
+  train_with_bins <- train_with_bins %>%
+    left_join(batter_overall, by = c("Batter", "PitcherThrows")) %>%
+    mutate(
+      # Use binned stats if available, otherwise use overall stats
+      batter_xrv_vs_similar = coalesce(batter_xrv_binned, batter_xrv_overall),
+      batter_n_similar = coalesce(batter_n_binned, batter_n_overall),
+      batter_whiff_vs_similar = coalesce(batter_whiff_binned, batter_whiff_overall),
+      batter_chase_vs_similar = coalesce(batter_chase_binned, batter_chase_overall)
+    ) %>%
+    filter(!is.na(batter_xrv_vs_similar))
+  
+  cat("Built training data with", nrow(train_with_bins), "samples\n")
+  train_with_bins
 }
 
 # ============================================================================
@@ -763,8 +802,8 @@ train_xrv_model_with_similarity <- function(tm_data, nrounds = 100, verbose = 0,
                                              distance_threshold = 1.0) {
   cat("Training xRV model with pitch similarity features...\n")
   
-  # Build training data with similarity features
-  train_df <- build_xrv_training_data_with_similarity(tm_data, distance_threshold)
+  # Build training data with pre-computed batter features (FAST)
+  train_df <- build_xrv_training_data_fast(tm_data, batter_binned_stats, batter_overall_stats)
   
   if (nrow(train_df) < 1000) {
     cat("Insufficient training data for xRV model\n")
