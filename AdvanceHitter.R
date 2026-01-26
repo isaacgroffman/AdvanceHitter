@@ -174,7 +174,9 @@ if (exists("TM2025")) {
   pitchers <- paste0("Pitcher_", LETTERS[1:10])
   hitters <- paste0("Hitter_", 1:30)
   pitch_types <- c("Fastball", "Sinker", "Slider", "Curveball", "Changeup", "Cutter")
-  
+  # Note: Sample data creation is incomplete - actual data should come from TM2025 or TM25
+  tm_data <- data.frame()
+}
 
 cat("Loaded", nrow(tm_data), "rows\n")
 
@@ -2404,7 +2406,7 @@ server <- function(input, output, session) {
     }, ignoreInit = TRUE)
   })
   
-output$download_scout_pdf <- downloadHandler(
+  output$download_scout_pdf <- downloadHandler(
     filename = function() { paste0("scouting_report_", format(Sys.Date(), "%Y%m%d"), ".pdf") },
     content = function(file) {
       data <- scout_data()
