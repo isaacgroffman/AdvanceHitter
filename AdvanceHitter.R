@@ -12,6 +12,7 @@ library(grid)
 library(scales)
 library(arrow)
 library(httr)
+library(xgboost)  # For xRV predictive model
 
 
 PASSWORD <- Sys.getenv("password")
@@ -276,6 +277,7 @@ tm_data <- add_indicators(tm_data)
 # Ensure all required columns exist in tm_data with proper defaults
 # This fixes the ifelse() bug where scalar conditions return only the first element
 if (!"mean_DRE_bat" %in% names(tm_data)) tm_data$mean_DRE_bat <- 0
+if (!"mean_DRE_pit" %in% names(tm_data)) tm_data$mean_DRE_pit <- 0  # Pitcher run value
 if (!"RelSpeed" %in% names(tm_data)) tm_data$RelSpeed <- 85
 if (!"InducedVertBreak" %in% names(tm_data)) tm_data$InducedVertBreak <- 12
 if (!"HorzBreak" %in% names(tm_data)) tm_data$HorzBreak <- 0
@@ -308,7 +310,7 @@ gc(verbose = FALSE)
 # PITCHER ARSENAL AND BATTER PITCH PERFORMANCE DATA FOR MAC MATCHUP
 # ============================================================================
 
-# Create pitcher arsenal summary
+# Create pitcher arsenal summary with run value
 # Note: Direct column references used instead of ifelse() to avoid scalar condition bug
 pitcher_arsenal <- tm_data %>%
   filter(!is.na(TaggedPitchType)) %>%
@@ -322,6 +324,7 @@ pitcher_arsenal <- tm_data %>%
     SpinRate = mean(SpinRate, na.rm = TRUE),
     RelHeight = mean(RelHeight, na.rm = TRUE),
     RelSide = mean(RelSide, na.rm = TRUE),
+    mean_DRE_pit = mean(mean_DRE_pit, na.rm = TRUE),  # Pitcher run value
     .groups = "drop"
   ) %>%
   filter(n >= 10) %>%
@@ -610,6 +613,363 @@ get_matchup_score_color <- function(score) {
   if (score >= 30) return("#FFE0B2")
   return("#FFCDD2")  # Hitter advantage - red
 }
+
+# ============================================================================
+# xRV PREDICTIVE MATCHUP MODEL - XGBoost with Bayesian Shrinkage
+# ============================================================================
+
+cat("Building xRV Predictive Model...\n")
+
+# Calculate SEC-wide prior distributions for Bayesian shrinkage (by pitch group)
+calculate_sec_priors <- function(sec_data) {
+  sec_data %>%
+    filter(!is.na(PitchFamily), !is.na(mean_DRE_bat)) %>%
+    group_by(PitchFamily) %>%
+    summarise(
+      prior_mean = mean(mean_DRE_bat, na.rm = TRUE),
+      prior_sd = sd(mean_DRE_bat, na.rm = TRUE),
+      n_total = n(),
+      .groups = "drop"
+    )
+}
+
+sec_priors <- calculate_sec_priors(sec_pool_data)
+cat("SEC priors calculated for", nrow(sec_priors), "pitch families\n")
+
+# Build aggregated batter performance data normalized to 300 PA rolling window
+build_batter_xrv_features <- function(tm_data, rolling_pa = 300) {
+  # Aggregate batter performance against each pitch family by pitcher hand
+  batter_perf <- tm_data %>%
+    filter(!is.na(PitchFamily), !is.na(mean_DRE_bat), !is.na(PitcherThrows)) %>%
+    group_by(Batter, PitcherThrows, PitchFamily) %>%
+    summarise(
+      n_pitches = n(),
+      n_pa = sum(is_pa, na.rm = TRUE),
+      raw_xrv = mean(mean_DRE_bat, na.rm = TRUE),
+      whiff_rate = sum(is_whiff, na.rm = TRUE) / pmax(1, sum(is_swing, na.rm = TRUE)),
+      chase_rate = sum(chase, na.rm = TRUE) / pmax(1, sum(out_of_zone, na.rm = TRUE)),
+      zone_contact = 1 - sum(in_zone_whiff, na.rm = TRUE) / pmax(1, sum(z_swing, na.rm = TRUE)),
+      # Pitch characteristic exposure
+      avg_velo_faced = mean(RelSpeed, na.rm = TRUE),
+      avg_ivb_faced = mean(InducedVertBreak, na.rm = TRUE),
+      avg_hb_faced = mean(HorzBreak, na.rm = TRUE),
+      avg_spin_faced = mean(SpinRate, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    filter(n_pitches >= 15)  # Minimum sample for stability
+  
+  # Normalize to rolling 300 PA window with shrinkage
+  # Use PA-weighted credibility factor
+  batter_perf <- batter_perf %>%
+    mutate(
+      credibility = n_pa / (n_pa + rolling_pa * 0.1),  # Shrinkage factor
+      # Get SEC prior for pitch family
+      prior_xrv = case_when(
+        PitchFamily == "FB" ~ sec_priors$prior_mean[sec_priors$PitchFamily == "FB"],
+        PitchFamily == "BB" ~ sec_priors$prior_mean[sec_priors$PitchFamily == "BB"],
+        PitchFamily == "OS" ~ sec_priors$prior_mean[sec_priors$PitchFamily == "OS"],
+        TRUE ~ 0
+      ),
+      # Bayesian shrinkage: blend raw performance with SEC prior
+      xrv_shrunk = credibility * raw_xrv + (1 - credibility) * prior_xrv
+    )
+  
+  batter_perf
+}
+
+batter_xrv_features <- build_batter_xrv_features(tm_data, rolling_pa = 300)
+cat("Built xRV features for", n_distinct(batter_xrv_features$Batter), "batters\n")
+
+# Build training data for XGBoost model
+# Matches batter performance against pitch characteristics and pitcher quality
+build_xrv_training_data <- function(tm_data, batter_features) {
+  # Create training set: each row is a pitch with features
+  train_data <- tm_data %>%
+    filter(!is.na(PitchFamily), !is.na(mean_DRE_bat), !is.na(PitcherThrows),
+           !is.na(RelSpeed), !is.na(InducedVertBreak), !is.na(HorzBreak)) %>%
+    select(Batter, Pitcher, PitcherThrows, PitchFamily,
+           RelSpeed, InducedVertBreak, HorzBreak, SpinRate, RelHeight, RelSide,
+           mean_DRE_bat, mean_DRE_pit) %>%
+    # Join batter historical performance
+    left_join(
+      batter_features %>%
+        select(Batter, PitcherThrows, PitchFamily, 
+               xrv_shrunk, whiff_rate, chase_rate, zone_contact,
+               n_pitches, credibility),
+      by = c("Batter", "PitcherThrows", "PitchFamily")
+    ) %>%
+    filter(!is.na(xrv_shrunk))  # Must have batter history
+  
+  train_data
+}
+
+# Train XGBoost model for xRV prediction (memory efficient)
+# Incorporates both pitcher quality (mean_DRE_pit) and batter performance
+train_xrv_model <- function(tm_data, batter_features, nrounds = 100, verbose = 0) {
+  cat("Preparing xRV training data...\n")
+  
+  # Build training data
+  train_df <- build_xrv_training_data(tm_data, batter_features)
+  
+  if (nrow(train_df) < 1000) {
+    cat("Insufficient training data for xRV model\n")
+    return(NULL)
+  }
+  
+  # Define feature columns - includes pitcher quality via mean_DRE_pit
+  feature_cols <- c("RelSpeed", "InducedVertBreak", "HorzBreak", "SpinRate", "RelHeight", "RelSide",
+                    "mean_DRE_pit",  # Pitcher run value for quality adjustment
+                    "xrv_shrunk", "whiff_rate", "chase_rate", "zone_contact", "credibility")
+  
+  # Prepare matrix - handle NAs
+  X <- train_df %>%
+    select(all_of(feature_cols)) %>%
+    mutate(across(everything(), ~ifelse(is.na(.), 0, .))) %>%
+    as.matrix()
+  
+  y <- train_df$mean_DRE_bat
+  
+  # Sample down if too large (memory efficiency)
+  max_samples <- 100000
+  if (nrow(X) > max_samples) {
+    idx <- sample(nrow(X), max_samples)
+    X <- X[idx, ]
+    y <- y[idx]
+  }
+  
+  cat("Training xRV model on", nrow(X), "samples with", ncol(X), "features...\n")
+  
+  # Create DMatrix
+  dtrain <- xgb.DMatrix(data = X, label = y)
+  
+  # XGBoost parameters optimized for run value prediction
+  params <- list(
+    objective = "reg:squarederror",
+    max_depth = 4,
+    eta = 0.1,
+    subsample = 0.8,
+    colsample_bytree = 0.8,
+    min_child_weight = 10,
+    gamma = 0.1
+  )
+  
+  # Train model
+  model <- xgb.train(
+    params = params,
+    data = dtrain,
+    nrounds = nrounds,
+    verbose = verbose
+  )
+  
+  # Clean up
+  rm(dtrain, X)
+  gc(verbose = FALSE)
+  
+  cat("xRV model trained successfully\n")
+  
+  list(
+    model = model,
+    feature_cols = feature_cols
+  )
+}
+
+# Train the xRV model
+xrv_model_data <- train_xrv_model(tm_data, batter_xrv_features, nrounds = 100)
+
+# Predict xRV for a specific pitcher-batter matchup
+predict_xrv_matchup <- function(pitcher_name, batter_name, pitch_family = NULL,
+                                 pitcher_arsenal, batter_features, xrv_model,
+                                 sec_priors) {
+  # Get pitcher's arsenal
+  p_arsenal <- pitcher_arsenal %>% filter(Pitcher == pitcher_name)
+  
+  if (nrow(p_arsenal) == 0) {
+    return(list(xrv = NA, xrv_per100 = NA, n_batter_pa = 0, confidence = "low"))
+  }
+  
+  # Filter by pitch family if specified
+  if (!is.null(pitch_family)) {
+    p_arsenal <- p_arsenal %>% filter(PitchFamily == pitch_family)
+    if (nrow(p_arsenal) == 0) {
+      return(list(xrv = NA, xrv_per100 = NA, n_batter_pa = 0, confidence = "low"))
+    }
+  }
+  
+  p_hand <- p_arsenal$PitcherThrows[1]
+  
+  # Get batter's performance data
+  batter_perf <- batter_features %>%
+    filter(Batter == batter_name, PitcherThrows == p_hand)
+  
+  if (!is.null(pitch_family)) {
+    batter_perf <- batter_perf %>% filter(PitchFamily == pitch_family)
+  }
+  
+  if (nrow(batter_perf) == 0) {
+    # No batter history - use SEC prior
+    prior_xrv <- if (!is.null(pitch_family)) {
+      prior_row <- sec_priors %>% filter(PitchFamily == pitch_family)
+      if (nrow(prior_row) > 0) prior_row$prior_mean[1] else 0
+    } else {
+      mean(sec_priors$prior_mean, na.rm = TRUE)
+    }
+    
+    return(list(
+      xrv = prior_xrv,
+      xrv_per100 = prior_xrv * 100,
+      n_batter_pa = 0,
+      confidence = "very_low"
+    ))
+  }
+  
+  # If model available, use XGBoost prediction
+  if (!is.null(xrv_model) && !is.null(xrv_model$model)) {
+    # Build prediction features for each pitch type in arsenal
+    predictions <- list()
+    total_usage <- 0
+    
+    for (i in 1:nrow(p_arsenal)) {
+      pt <- p_arsenal$PitchFamily[i]
+      usage <- p_arsenal$usage_pct[i]
+      
+      # Get batter perf for this pitch type
+      b_perf <- batter_perf %>% filter(PitchFamily == pt)
+      
+      if (nrow(b_perf) == 0) {
+        # Use SEC prior for this pitch type
+        prior_row <- sec_priors %>% filter(PitchFamily == pt)
+        pred_xrv <- if (nrow(prior_row) > 0) prior_row$prior_mean[1] else 0
+      } else {
+        # Build feature vector including pitcher quality
+        pit_dre <- if (!is.na(p_arsenal$mean_DRE_pit[i])) p_arsenal$mean_DRE_pit[i] else 0
+        
+        features <- data.frame(
+          RelSpeed = p_arsenal$RelSpeed[i],
+          InducedVertBreak = p_arsenal$InducedVertBreak[i],
+          HorzBreak = p_arsenal$HorzBreak[i],
+          SpinRate = ifelse(is.na(p_arsenal$SpinRate[i]), 2200, p_arsenal$SpinRate[i]),
+          RelHeight = ifelse(is.na(p_arsenal$RelHeight[i]), 6, p_arsenal$RelHeight[i]),
+          RelSide = ifelse(is.na(p_arsenal$RelSide[i]), 0, p_arsenal$RelSide[i]),
+          mean_DRE_pit = pit_dre,  # Pitcher quality adjustment
+          xrv_shrunk = b_perf$xrv_shrunk[1],
+          whiff_rate = ifelse(is.na(b_perf$whiff_rate[1]), 0.25, b_perf$whiff_rate[1]),
+          chase_rate = ifelse(is.na(b_perf$chase_rate[1]), 0.28, b_perf$chase_rate[1]),
+          zone_contact = ifelse(is.na(b_perf$zone_contact[1]), 0.85, b_perf$zone_contact[1]),
+          credibility = b_perf$credibility[1]
+        )
+        
+        # Replace any remaining NAs with 0
+        features[is.na(features)] <- 0
+        
+        X_pred <- as.matrix(features)
+        pred_xrv <- predict(xrv_model$model, X_pred)[1]
+      }
+      
+      predictions[[pt]] <- list(xrv = pred_xrv, usage = usage)
+      total_usage <- total_usage + usage
+    }
+    
+    # Calculate weighted xRV across arsenal
+    if (total_usage > 0) {
+      weighted_xrv <- sum(sapply(names(predictions), function(pt) {
+        predictions[[pt]]$xrv * predictions[[pt]]$usage
+      })) / total_usage
+    } else {
+      weighted_xrv <- mean(sapply(predictions, function(x) x$xrv))
+    }
+  } else {
+    # Fallback: use shrunk batter performance directly
+    if (!is.null(pitch_family)) {
+      weighted_xrv <- mean(batter_perf$xrv_shrunk, na.rm = TRUE)
+    } else {
+      # Weight by pitcher's usage
+      weighted_xrv <- 0
+      total_usage <- 0
+      for (i in 1:nrow(p_arsenal)) {
+        pt <- p_arsenal$PitchFamily[i]
+        usage <- p_arsenal$usage_pct[i]
+        b_pt <- batter_perf %>% filter(PitchFamily == pt)
+        if (nrow(b_pt) > 0) {
+          weighted_xrv <- weighted_xrv + b_pt$xrv_shrunk[1] * usage
+          total_usage <- total_usage + usage
+        }
+      }
+      if (total_usage > 0) {
+        weighted_xrv <- weighted_xrv / total_usage
+      } else {
+        weighted_xrv <- mean(batter_perf$xrv_shrunk, na.rm = TRUE)
+      }
+    }
+  }
+  
+  # Calculate confidence based on batter sample
+  total_pa <- sum(batter_perf$n_pitches, na.rm = TRUE)
+  avg_cred <- mean(batter_perf$credibility, na.rm = TRUE)
+  
+  confidence <- case_when(
+    total_pa >= 200 && avg_cred >= 0.7 ~ "high",
+    total_pa >= 100 && avg_cred >= 0.5 ~ "medium",
+    total_pa >= 50 ~ "low",
+    TRUE ~ "very_low"
+  )
+  
+  list(
+    xrv = weighted_xrv,
+    xrv_per100 = weighted_xrv * 100,
+    n_batter_pa = total_pa,
+    confidence = confidence
+  )
+}
+
+# Calculate full matchup xRV (overall + by pitch group)
+calculate_xrv_matchup <- function(pitcher_name, batter_name, 
+                                   pitcher_arsenal = pitcher_arsenal,
+                                   batter_features = batter_xrv_features,
+                                   xrv_model = xrv_model_data,
+                                   sec_priors = sec_priors) {
+  # Overall xRV
+  overall <- predict_xrv_matchup(pitcher_name, batter_name, NULL,
+                                  pitcher_arsenal, batter_features, xrv_model, sec_priors)
+  
+  # By pitch group
+  fb_result <- predict_xrv_matchup(pitcher_name, batter_name, "FB",
+                                    pitcher_arsenal, batter_features, xrv_model, sec_priors)
+  bb_result <- predict_xrv_matchup(pitcher_name, batter_name, "BB",
+                                    pitcher_arsenal, batter_features, xrv_model, sec_priors)
+  os_result <- predict_xrv_matchup(pitcher_name, batter_name, "OS",
+                                    pitcher_arsenal, batter_features, xrv_model, sec_priors)
+  
+  list(
+    overall_xrv = overall$xrv_per100,
+    fb_xrv = fb_result$xrv_per100,
+    bb_xrv = bb_result$xrv_per100,
+    os_xrv = os_result$xrv_per100,
+    confidence = overall$confidence,
+    n_pa = overall$n_batter_pa
+  )
+}
+
+# Helper function for xRV color coding (positive = hitter advantage = red)
+get_xrv_color <- function(xrv) {
+  if (is.na(xrv)) return("#E0E0E0")
+  if (xrv >= 1.5) return("#FFCDD2")    # Strong hitter advantage - red
+  if (xrv >= 0.5) return("#FFE0B2")    # Moderate hitter advantage
+  if (xrv >= 0) return("#FFF9C4")      # Slight hitter advantage - yellow
+  if (xrv >= -0.5) return("#F0F4C3")   # Slight pitcher advantage
+  if (xrv >= -1.5) return("#DCEDC8")   # Moderate pitcher advantage
+  return("#C8E6C9")                     # Strong pitcher advantage - green
+}
+
+# Helper function for xRV text color
+get_xrv_text_color <- function(xrv) {
+  if (is.na(xrv)) return("#666666")
+  if (xrv >= 0.5) return("#C62828")    # Red text for hitter advantage
+  if (xrv >= -0.5) return("#F57F17")   # Orange/yellow for neutral
+  return("#2E7D32")                     # Green text for pitcher advantage
+}
+
+cat("xRV Predictive Model setup complete\n")
+gc(verbose = FALSE)
 
 # ============================================================================
 # RUN VALUE CALCULATION FUNCTION
@@ -1588,54 +1948,42 @@ app_ui <- fluidPage(
         column(9, uiOutput("hitter_detail_panel")))
     ),
     
-    # ===== MATCHUP MATRICES TAB =====
-    tabPanel("Matchup Matrices",
-      div(class = "stats-header", h3("Matchup Matrices"), p("MAC-style pitcher vs hitter matchup calculations with 0-100 scores")),
+    # ===== xRV MATCHUP MATRIX TAB =====
+    tabPanel("xRV Matchup Matrix",
+      div(class = "stats-header", 
+          h3("xRV Matchup Predictions"), 
+          p("Expected Run Value (xRV) predictions based on pitcher arsenal vs batter performance with SEC Bayesian priors")),
       
       fluidRow(
         column(12,
-          tabsetPanel(id = "matrix_subtabs", type = "pills",
-            # Overall Matrix Tab
-            tabPanel("Overall Matrix",
-              div(class = "chart-box", style = "margin-top: 15px;",
-                div(class = "chart-box-title", "Multi-Pitcher vs Multi-Hitter Matchup Matrix"),
-                fluidRow(
-                  column(4,
-                    selectizeInput("matrix_pitchers", "Select Pitchers:", choices = NULL, multiple = TRUE,
-                                   options = list(placeholder = "Search pitchers...", maxItems = 15))),
-                  column(4,
-                    selectizeInput("matrix_hitters", "Select Hitters:", choices = NULL, multiple = TRUE,
-                                   options = list(placeholder = "Search hitters...", maxItems = 15))),
-                  column(4,
-                    actionButton("generate_matrix", "Generate Matrix", class = "btn-bronze", style = "margin-top: 25px;"))
-                ),
-                div(style = "margin-top: 10px; font-size: 12px; color: #666;",
-                    "Score interpretation: 0-40 = Hitter Advantage (red), 45-55 = Neutral (yellow), 60-100 = Pitcher Advantage (green)"),
-                hr(),
-                div(style = "overflow-x: auto;", uiOutput("overall_matrix_output"))
+          div(class = "chart-box", style = "margin-top: 15px;",
+            div(class = "chart-box-title", "Pitcher vs Hitter xRV Matchup Matrix"),
+            fluidRow(
+              column(3,
+                selectizeInput("xrv_pitchers", "Select Pitchers:", choices = NULL, multiple = TRUE,
+                               options = list(placeholder = "Search pitchers...", maxItems = 10))),
+              column(3,
+                selectizeInput("xrv_hitters", "Select Hitters:", choices = NULL, multiple = TRUE,
+                               options = list(placeholder = "Search hitters...", maxItems = 12))),
+              column(3,
+                actionButton("generate_xrv_matrix", "Generate xRV Matrix", class = "btn-bronze", style = "margin-top: 25px;")),
+              column(3,
+                downloadButton("download_xrv_png", "Download as PNG", class = "btn-bronze", style = "margin-top: 25px;"))
+            ),
+            div(style = "margin-top: 10px; padding: 10px; background: #f5f5f5; border-radius: 5px;",
+              div(style = "font-size: 12px; color: #333;",
+                tags$b("xRV Interpretation:"), " Positive (+) = Hitter Advantage, Negative (-) = Pitcher Advantage"),
+              div(style = "display: flex; gap: 15px; margin-top: 5px; font-size: 11px;",
+                tags$span(style = "background: #FFCDD2; padding: 2px 8px; border-radius: 3px;", "+1.5+ Strong Hitter"),
+                tags$span(style = "background: #FFE0B2; padding: 2px 8px; border-radius: 3px;", "+0.5 to +1.5 Hitter"),
+                tags$span(style = "background: #FFF9C4; padding: 2px 8px; border-radius: 3px;", "-0.5 to +0.5 Neutral"),
+                tags$span(style = "background: #DCEDC8; padding: 2px 8px; border-radius: 3px;", "-1.5 to -0.5 Pitcher"),
+                tags$span(style = "background: #C8E6C9; padding: 2px 8px; border-radius: 3px;", "-1.5+ Strong Pitcher")
               )
             ),
-            
-            # Pitch Type Matrix Tab
-            tabPanel("Pitch Type Matrix",
-              div(class = "chart-box", style = "margin-top: 15px;",
-                div(class = "chart-box-title", "Single Pitcher vs Multiple Hitters - By Pitch Type"),
-                fluidRow(
-                  column(4,
-                    selectizeInput("pt_matrix_pitcher", "Select Pitcher:", choices = NULL, multiple = FALSE,
-                                   options = list(placeholder = "Search pitcher..."))),
-                  column(4,
-                    selectizeInput("pt_matrix_hitters", "Select Hitters:", choices = NULL, multiple = TRUE,
-                                   options = list(placeholder = "Search hitters...", maxItems = 15))),
-                  column(4,
-                    actionButton("generate_pt_matrix", "Generate Pitch Type Matrix", class = "btn-bronze", style = "margin-top: 25px;"))
-                ),
-                div(style = "margin-top: 10px; font-size: 12px; color: #666;",
-                    "Shows matchup scores for each pitch type group: FB (Fastballs), BB (Breaking Balls), OS (Offspeed)"),
-                hr(),
-                div(style = "overflow-x: auto;", uiOutput("pitch_type_matrix_output"))
-              )
-            )
+            hr(),
+            div(id = "xrv_matrix_container", style = "overflow-x: auto;", 
+                uiOutput("xrv_matrix_output"))
           )
         )
       )
@@ -1674,17 +2022,17 @@ server <- function(input, output, session) {
   
   scout_data <- reactiveVal(list())
   selected_hitter <- reactiveVal(NULL)
-  matrix_data <- reactiveVal(NULL)
-  pt_matrix_data <- reactiveVal(NULL)
+  # xRV Matrix reactive values
+  xrv_matrix_data <- reactiveVal(NULL)
+  xrv_notes <- reactiveVal(list())  # Store notes for each matchup
   
   # Initialize all selectize inputs AFTER login
   observeEvent(logged_in(), {
     if (logged_in()) {
       updateSelectizeInput(session, "scout_hitters", choices = all_hitters, server = TRUE) 
-      updateSelectizeInput(session, "matrix_pitchers", choices = all_pitchers, server = TRUE)
-      updateSelectizeInput(session, "matrix_hitters", choices = all_hitters, server = TRUE)
-      updateSelectizeInput(session, "pt_matrix_pitcher", choices = all_pitchers, server = TRUE)
-      updateSelectizeInput(session, "pt_matrix_hitters", choices = all_hitters, server = TRUE)
+      # xRV Matchup Matrix inputs
+      updateSelectizeInput(session, "xrv_pitchers", choices = all_pitchers, server = TRUE)
+      updateSelectizeInput(session, "xrv_hitters", choices = all_hitters, server = TRUE)
     }
   }, ignoreInit = TRUE)
   
@@ -2406,191 +2754,321 @@ output$download_scout_pdf <- downloadHandler(
   )
                                                 
   # ============================================================================
-  # MATCHUP MATRICES SERVER LOGIC
+  # xRV MATCHUP MATRIX SERVER LOGIC
   # ============================================================================
   
-  # Generate Overall Matchup Matrix
-  observeEvent(input$generate_matrix, {
-    req(input$matrix_pitchers, input$matrix_hitters)
+  # Generate xRV Matchup Matrix
+  observeEvent(input$generate_xrv_matrix, {
+    req(input$xrv_pitchers, input$xrv_hitters)
     
-    pitchers <- input$matrix_pitchers
-    hitters <- input$matrix_hitters
+    pitchers <- input$xrv_pitchers
+    hitters <- input$xrv_hitters
     
     if (length(pitchers) == 0 || length(hitters) == 0) {
       showNotification("Please select at least one pitcher and one hitter", type = "warning")
       return()
     }
     
-    # Calculate matchup matrix
-    matrix_results <- matrix(NA, nrow = length(hitters), ncol = length(pitchers))
-    rownames(matrix_results) <- hitters
-    colnames(matrix_results) <- pitchers
+    # Calculate xRV matchup matrix with pitch group breakdown
+    results_list <- list()
     
-    withProgress(message = "Calculating matchups...", value = 0, {
+    withProgress(message = "Calculating xRV predictions...", value = 0, {
       total <- length(pitchers) * length(hitters)
       counter <- 0
       
       for (p_idx in seq_along(pitchers)) {
         for (h_idx in seq_along(hitters)) {
-          result <- calculate_mac_matchup(pitchers[p_idx], hitters[h_idx])
-          matrix_results[h_idx, p_idx] <- result$score
+          pitcher <- pitchers[p_idx]
+          hitter <- hitters[h_idx]
+          key <- paste0(pitcher, "||", hitter)
+          
+          # Calculate xRV matchup
+          matchup_result <- calculate_xrv_matchup(
+            pitcher, hitter,
+            pitcher_arsenal, batter_xrv_features, xrv_model_data, sec_priors
+          )
+          
+          results_list[[key]] <- matchup_result
           counter <- counter + 1
           incProgress(1/total)
         }
       }
     })
     
-    matrix_data(list(matrix = matrix_results, pitchers = pitchers, hitters = hitters))
+    xrv_matrix_data(list(results = results_list, pitchers = pitchers, hitters = hitters))
+    showNotification("xRV Matrix generated successfully!", type = "message")
   })
   
-  # Render Overall Matchup Matrix
-  output$overall_matrix_output <- renderUI({
-    data <- matrix_data()
+  # Handle note updates from matrix cells
+  observeEvent(input$xrv_note_update, {
+    note_data <- input$xrv_note_update
+    if (!is.null(note_data)) {
+      current_notes <- xrv_notes()
+      current_notes[[note_data$key]] <- note_data$value
+      xrv_notes(current_notes)
+    }
+  })
+  
+  # Render xRV Matchup Matrix
+  output$xrv_matrix_output <- renderUI({
+    data <- xrv_matrix_data()
     if (is.null(data)) {
       return(div(style = "text-align: center; padding: 40px; color: #666;",
-                 p("Select pitchers and hitters, then click 'Generate Matrix' to see matchup scores.")))
+                 p("Select pitchers and hitters, then click 'Generate xRV Matrix' to see predicted matchup values."),
+                 p(style = "font-size: 12px; margin-top: 10px;", 
+                   "The model uses pitcher arsenal characteristics (velocity, movement, spin) and batter historical performance with SEC Bayesian priors.")))
     }
     
-    matrix <- data$matrix
+    results <- data$results
     pitchers <- data$pitchers
     hitters <- data$hitters
+    current_notes <- xrv_notes()
     
-    # Build HTML table
+    # Build HTML table with pitchers on top, hitters on side
+    # Header row with pitcher names
     header_cells <- lapply(pitchers, function(p) {
-      tags$th(style = "padding: 8px; background: #006F71; color: white; font-size: 11px; min-width: 80px;", 
-              substr(p, 1, 15))
+      # Get pitcher hand
+      p_hand <- pitcher_arsenal %>% filter(Pitcher == p) %>% pull(PitcherThrows) %>% unique() %>% first()
+      p_hand_label <- if(!is.na(p_hand)) paste0(" (", substr(p_hand, 1, 1), "HP)") else ""
+      
+      tags$th(style = "padding: 10px; background: #006F71; color: white; font-size: 11px; min-width: 140px; text-align: center; vertical-align: bottom;", 
+              div(style = "font-weight: bold;", substr(p, 1, 18)),
+              div(style = "font-size: 9px; font-weight: normal;", p_hand_label))
     })
     
+    # Table rows - one per hitter
     table_rows <- lapply(seq_along(hitters), function(h_idx) {
       h_name <- hitters[h_idx]
       
-      score_cells <- lapply(seq_along(pitchers), function(p_idx) {
-        score <- matrix[h_idx, p_idx]
-        bg_color <- get_matchup_score_color(score)
-        text_color <- if(score >= 55) "#2E7D32" else if(score >= 45) "#F57F17" else "#C62828"
+      # Create cells for each pitcher
+      matchup_cells <- lapply(seq_along(pitchers), function(p_idx) {
+        pitcher <- pitchers[p_idx]
+        key <- paste0(pitcher, "||", h_name)
         
-        tags$td(style = paste0("padding: 8px; text-align: center; background: ", bg_color, 
-                               "; font-weight: bold; font-size: 14px; color: ", text_color, ";"),
-                if(is.na(score)) "-" else score)
-      })
-      
-      tags$tr(
-        tags$td(style = "padding: 8px; background: #f5f5f5; font-weight: bold; font-size: 11px;", 
-                substr(h_name, 1, 15)),
-        score_cells
-      )
-    })
-    
-    tags$table(style = "border-collapse: collapse; width: 100%; margin-top: 10px;",
-               tags$thead(tags$tr(tags$th(style = "padding: 8px; background: #37474F; color: white;", "Hitter \\ Pitcher"), header_cells)),
-               tags$tbody(table_rows))
-  })
-  
-  # Generate Pitch Type Matrix
-  observeEvent(input$generate_pt_matrix, {
-    req(input$pt_matrix_pitcher, input$pt_matrix_hitters)
-    
-    pitcher <- input$pt_matrix_pitcher
-    hitters <- input$pt_matrix_hitters
-    
-    if (is.null(pitcher) || length(hitters) == 0) {
-      showNotification("Please select a pitcher and at least one hitter", type = "warning")
-      return()
-    }
-    
-    # Calculate pitch type matchup matrix (FB, BB, OS for each hitter)
-    pitch_types <- c("FB", "BB", "OS")
-    matrix_results <- matrix(NA, nrow = length(hitters), ncol = length(pitch_types))
-    rownames(matrix_results) <- hitters
-    colnames(matrix_results) <- pitch_types
-    
-    # Also calculate overall scores
-    overall_scores <- numeric(length(hitters))
-    
-    withProgress(message = "Calculating pitch type matchups...", value = 0, {
-      total <- length(hitters)
-      
-      for (h_idx in seq_along(hitters)) {
-        # Overall score
-        overall_result <- calculate_mac_matchup(pitcher, hitters[h_idx])
-        overall_scores[h_idx] <- overall_result$score
+        matchup <- results[[key]]
         
-        # By pitch type
-        for (pt_idx in seq_along(pitch_types)) {
-          result <- calculate_pitch_type_matchup(pitcher, hitters[h_idx], pitch_types[pt_idx])
-          matrix_results[h_idx, pt_idx] <- result$score
+        if (is.null(matchup) || is.na(matchup$overall_xrv)) {
+          return(tags$td(style = "padding: 8px; text-align: center; background: #E0E0E0; vertical-align: top;",
+                        div(style = "font-size: 12px; color: #666;", "N/A")))
         }
-        incProgress(1/total)
-      }
-    })
-    
-    pt_matrix_data(list(matrix = matrix_results, pitcher = pitcher, hitters = hitters, 
-                        overall = overall_scores, pitch_types = pitch_types))
-  })
-  
-  # Render Pitch Type Matrix
-  output$pitch_type_matrix_output <- renderUI({
-    data <- pt_matrix_data()
-    if (is.null(data)) {
-      return(div(style = "text-align: center; padding: 40px; color: #666;",
-                 p("Select a pitcher and hitters, then click 'Generate Pitch Type Matrix' to see matchup scores by pitch type.")))
-    }
-    
-    matrix <- data$matrix
-    pitcher <- data$pitcher
-    hitters <- data$hitters
-    overall <- data$overall
-    pitch_types <- data$pitch_types
-    pitch_labels <- c("FB" = "Fastballs", "BB" = "Breaking", "OS" = "Offspeed")
-    
-    # Header
-    header_cells <- c(
-      list(tags$th(style = "padding: 8px; background: #6A1B9A; color: white; font-size: 11px;", "Overall")),
-      lapply(pitch_types, function(pt) {
-        tags$th(style = "padding: 8px; background: #006F71; color: white; font-size: 11px;", pitch_labels[pt])
-      })
-    )
-    
-    table_rows <- lapply(seq_along(hitters), function(h_idx) {
-      h_name <- hitters[h_idx]
-      
-      # Overall cell
-      overall_score <- overall[h_idx]
-      overall_bg <- get_matchup_score_color(overall_score)
-      overall_text <- if(overall_score >= 55) "#2E7D32" else if(overall_score >= 45) "#F57F17" else "#C62828"
-      
-      overall_cell <- tags$td(style = paste0("padding: 8px; text-align: center; background: ", overall_bg, 
-                                             "; font-weight: bold; font-size: 14px; color: ", overall_text, ";"),
-                              if(is.na(overall_score)) "-" else overall_score)
-      
-      # Pitch type cells
-      pt_cells <- lapply(seq_along(pitch_types), function(pt_idx) {
-        score <- matrix[h_idx, pt_idx]
-        bg_color <- get_matchup_score_color(score)
-        text_color <- if(score >= 55) "#2E7D32" else if(score >= 45) "#F57F17" else "#C62828"
         
-        tags$td(style = paste0("padding: 8px; text-align: center; background: ", bg_color, 
-                               "; font-weight: bold; font-size: 14px; color: ", text_color, ";"),
-                if(is.na(score)) "-" else score)
+        # Colors based on xRV
+        overall_bg <- get_xrv_color(matchup$overall_xrv)
+        overall_text <- get_xrv_text_color(matchup$overall_xrv)
+        
+        fb_bg <- get_xrv_color(matchup$fb_xrv)
+        bb_bg <- get_xrv_color(matchup$bb_xrv)
+        os_bg <- get_xrv_color(matchup$os_xrv)
+        
+        # Format xRV values
+        format_xrv <- function(val) {
+          if (is.na(val)) return("-")
+          sprintf("%+.1f", val)
+        }
+        
+        # Get existing note
+        note_key <- gsub("[^A-Za-z0-9]", "_", key)
+        existing_note <- if (!is.null(current_notes[[key]])) current_notes[[key]] else ""
+        
+        # Cell content
+        tags$td(style = paste0("padding: 6px; vertical-align: top; background: ", overall_bg, "; border: 1px solid #ddd;"),
+          # Overall xRV (prominent)
+          div(style = paste0("text-align: center; font-size: 18px; font-weight: bold; color: ", overall_text, "; margin-bottom: 4px;"),
+              format_xrv(matchup$overall_xrv)),
+          
+          # Pitch group breakdown
+          div(style = "display: flex; justify-content: space-around; font-size: 10px; margin-bottom: 4px;",
+            tags$span(style = paste0("background: ", fb_bg, "; padding: 2px 4px; border-radius: 3px;"),
+                     "FB: ", format_xrv(matchup$fb_xrv)),
+            tags$span(style = paste0("background: ", os_bg, "; padding: 2px 4px; border-radius: 3px;"),
+                     "OS: ", format_xrv(matchup$os_xrv)),
+            tags$span(style = paste0("background: ", bb_bg, "; padding: 2px 4px; border-radius: 3px;"),
+                     "BB: ", format_xrv(matchup$bb_xrv))
+          ),
+          
+          # Confidence indicator
+          div(style = "text-align: center; font-size: 9px; color: #666; margin-bottom: 3px;",
+              paste0("(", matchup$confidence, ")")),
+          
+          # Notes input
+          tags$textarea(
+            id = paste0("note_", note_key),
+            class = "xrv-note-input",
+            style = "width: 100%; height: 35px; font-size: 9px; border: 1px solid #ccc; border-radius: 3px; padding: 2px; resize: none;",
+            placeholder = "Notes...",
+            onchange = sprintf("Shiny.setInputValue('xrv_note_update', {key: '%s', value: this.value}, {priority: 'event'});", key),
+            existing_note
+          )
+        )
       })
       
+      # Hitter row
       tags$tr(
-        tags$td(style = "padding: 8px; background: #f5f5f5; font-weight: bold; font-size: 11px;", 
-                substr(h_name, 1, 15)),
-        overall_cell,
-        pt_cells
+        tags$td(style = "padding: 8px; background: #f5f5f5; font-weight: bold; font-size: 11px; vertical-align: middle; min-width: 120px;", 
+                substr(h_name, 1, 20)),
+        matchup_cells
       )
     })
+    
+    # Legend row at bottom
+    legend_row <- tags$tr(
+      tags$td(colspan = length(pitchers) + 1, style = "padding: 10px; background: #fafafa; font-size: 10px; color: #666;",
+        div(style = "display: flex; justify-content: center; gap: 20px; flex-wrap: wrap;",
+          tags$span(tags$b("xRV"), " = Expected Run Value per 100 pitches"),
+          tags$span(tags$b("FB"), " = Fastballs"),
+          tags$span(tags$b("OS"), " = Offspeed (CH, Split)"),
+          tags$span(tags$b("BB"), " = Breaking Balls (SL, CB, CUT)")
+        )
+      )
+    )
     
     tagList(
-      div(style = "margin-bottom: 10px; font-weight: bold; color: #006F71;",
-          paste0("Pitcher: ", pitcher)),
+      tags$style(HTML("
+        .xrv-note-input:focus {
+          outline: 2px solid #006F71;
+          border-color: #006F71;
+        }
+      ")),
       tags$table(style = "border-collapse: collapse; width: 100%; margin-top: 10px;",
-                 tags$thead(tags$tr(tags$th(style = "padding: 8px; background: #37474F; color: white;", "Hitter"), header_cells)),
-                 tags$tbody(table_rows))
+                 tags$thead(
+                   tags$tr(
+                     tags$th(style = "padding: 10px; background: #37474F; color: white; font-size: 12px;", "Hitter \\ Pitcher"), 
+                     header_cells
+                   )
+                 ),
+                 tags$tbody(table_rows, legend_row))
     )
   })
-}
+  
+  # Download xRV Matrix as PNG
+  output$download_xrv_png <- downloadHandler(
+    filename = function() {
+      paste0("xRV_Matchup_Matrix_", format(Sys.Date(), "%Y%m%d"), ".png")
+    },
+    content = function(file) {
+      data <- xrv_matrix_data()
+      if (is.null(data)) {
+        # Create empty placeholder
+        png(file, width = 400, height = 200)
+        plot.new()
+        text(0.5, 0.5, "No data to export. Generate matrix first.", cex = 1.2)
+        dev.off()
+        return()
+      }
+      
+      results <- data$results
+      pitchers <- data$pitchers
+      hitters <- data$hitters
+      current_notes <- xrv_notes()
+      
+      # Calculate dimensions
+      n_pitchers <- length(pitchers)
+      n_hitters <- length(hitters)
+      
+      cell_width <- 120
+      cell_height <- 80
+      header_height <- 50
+      row_label_width <- 150
+      
+      img_width <- row_label_width + n_pitchers * cell_width + 40
+      img_height <- header_height + n_hitters * cell_height + 80
+      
+      png(file, width = img_width, height = img_height, res = 100)
+      
+      grid::grid.newpage()
+      
+      # Title
+      grid::grid.text("xRV Matchup Predictions", x = 0.5, y = 0.97, 
+                     gp = grid::gpar(fontsize = 14, fontface = "bold", col = "#006F71"))
+      grid::grid.text(paste0("Generated: ", Sys.Date()), x = 0.5, y = 0.94,
+                     gp = grid::gpar(fontsize = 9, col = "gray50"))
+      
+      # Calculate viewport dimensions
+      plot_top <- 0.90
+      plot_height <- 0.85
+      
+      # Draw header row (pitcher names)
+      for (p_idx in seq_along(pitchers)) {
+        x_pos <- (row_label_width + (p_idx - 0.5) * cell_width) / img_width
+        y_pos <- plot_top
+        
+        grid::grid.rect(x = x_pos, y = y_pos, width = (cell_width - 2) / img_width, height = 0.04,
+                       gp = grid::gpar(fill = "#006F71", col = "white"))
+        grid::grid.text(substr(pitchers[p_idx], 1, 15), x = x_pos, y = y_pos,
+                       gp = grid::gpar(fontsize = 8, col = "white", fontface = "bold"))
+      }
+      
+      # Row label header
+      grid::grid.rect(x = (row_label_width / 2) / img_width, y = plot_top, 
+                     width = (row_label_width - 4) / img_width, height = 0.04,
+                     gp = grid::gpar(fill = "#37474F", col = "white"))
+      grid::grid.text("Hitter", x = (row_label_width / 2) / img_width, y = plot_top,
+                     gp = grid::gpar(fontsize = 9, col = "white", fontface = "bold"))
+      
+      # Draw data rows
+      for (h_idx in seq_along(hitters)) {
+        hitter <- hitters[h_idx]
+        row_y <- plot_top - 0.04 - (h_idx - 0.5) * (cell_height / img_height)
+        
+        # Hitter name cell
+        grid::grid.rect(x = (row_label_width / 2) / img_width, y = row_y,
+                       width = (row_label_width - 4) / img_width, height = (cell_height - 2) / img_height,
+                       gp = grid::gpar(fill = "#f5f5f5", col = "#ddd"))
+        grid::grid.text(substr(hitter, 1, 20), x = (row_label_width / 2) / img_width, y = row_y,
+                       gp = grid::gpar(fontsize = 8, fontface = "bold"))
+        
+        # Data cells
+        for (p_idx in seq_along(pitchers)) {
+          pitcher <- pitchers[p_idx]
+          key <- paste0(pitcher, "||", hitter)
+          matchup <- results[[key]]
+          
+          x_pos <- (row_label_width + (p_idx - 0.5) * cell_width) / img_width
+          
+          if (is.null(matchup) || is.na(matchup$overall_xrv)) {
+            grid::grid.rect(x = x_pos, y = row_y,
+                           width = (cell_width - 2) / img_width, height = (cell_height - 2) / img_height,
+                           gp = grid::gpar(fill = "#E0E0E0", col = "#ddd"))
+            grid::grid.text("N/A", x = x_pos, y = row_y,
+                           gp = grid::gpar(fontsize = 10, col = "#666"))
+          } else {
+            bg_col <- get_xrv_color(matchup$overall_xrv)
+            text_col <- get_xrv_text_color(matchup$overall_xrv)
+            
+            grid::grid.rect(x = x_pos, y = row_y,
+                           width = (cell_width - 2) / img_width, height = (cell_height - 2) / img_height,
+                           gp = grid::gpar(fill = bg_col, col = "#ddd"))
+            
+            # Overall xRV
+            grid::grid.text(sprintf("%+.1f", matchup$overall_xrv), x = x_pos, y = row_y + 0.02,
+                           gp = grid::gpar(fontsize = 14, fontface = "bold", col = text_col))
+            
+            # Pitch breakdown
+            format_xrv_short <- function(val) if(is.na(val)) "-" else sprintf("%+.1f", val)
+            breakdown_text <- paste0("FB:", format_xrv_short(matchup$fb_xrv), 
+                                    " OS:", format_xrv_short(matchup$os_xrv),
+                                    " BB:", format_xrv_short(matchup$bb_xrv))
+            grid::grid.text(breakdown_text, x = x_pos, y = row_y - 0.015,
+                           gp = grid::gpar(fontsize = 7, col = "gray30"))
+            
+            # Notes if present
+            note <- current_notes[[key]]
+            if (!is.null(note) && nchar(note) > 0) {
+              grid::grid.text(substr(note, 1, 25), x = x_pos, y = row_y - 0.035,
+                             gp = grid::gpar(fontsize = 6, col = "gray50", fontface = "italic"))
+            }
+          }
+        }
+      }
+      
+      # Legend
+      legend_y <- 0.03
+      grid::grid.text("xRV = Expected Run Value/100 pitches  |  (+) Hitter Advantage  |  (-) Pitcher Advantage  |  FB=Fastball  OS=Offspeed  BB=Breaking",
+                     x = 0.5, y = legend_y, gp = grid::gpar(fontsize = 8, col = "gray50"))
+      
+      dev.off()
+    }
+  )
 }
 
 shinyApp(ui = ui, server = server)
