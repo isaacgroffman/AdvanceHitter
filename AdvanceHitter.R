@@ -967,24 +967,6 @@ get_pitcher_sec_stats <- function(pitcher_name, batter_side) {
   )
 }
 
-# Function to get pitcher stats for all batter sides (for matrix display)
-get_pitcher_matrix_stats <- function(pitcher_name) {
-  vs_lhb <- get_pitcher_sec_stats(pitcher_name, "Left")
-  vs_rhb <- get_pitcher_sec_stats(pitcher_name, "Right")
-  
-  # Get pitcher hand
-  p_hand <- pitcher_arsenal %>% 
-    filter(Pitcher == pitcher_name) %>% 
-    pull(PitcherThrows) %>% 
-    unique() %>% 
-    first()
-  
-  list(
-    pitcher_hand = if(!is.na(p_hand)) p_hand else "Unknown",
-    vs_lhb = vs_lhb,
-    vs_rhb = vs_rhb
-  )
-}
 
 # Helper function for xRV color coding (positive = hitter advantage = red)
 get_xrv_color <- function(xrv) {
@@ -2462,9 +2444,6 @@ app_css <- HTML("
   .heatmap-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
   .heatmap-row { display: flex; justify-content: space-around; gap: 4px; }
   .symmetric-row { display: flex; justify-content: center; gap: 12px; }
-  .matrix-table { border-collapse: collapse; width: 100%; }
-  .matrix-table th, .matrix-table td { border: 1px solid #ddd; padding: 8px; text-align: center; }
-  .matrix-table th { background: #006F71; color: white; }
   .nav-tabs > li > a { color: #006F71; font-weight: 600; }
   .nav-tabs > li.active > a { background: #006F71 !important; color: white !important; }
   .nav-pills > li > a { color: #006F71; }
@@ -3281,8 +3260,8 @@ output$download_scout_pdf <- downloadHandler(
       
       # Within each hitter row - offsets from row top
       ROW1_OFFSET <- 0.012      # Name/stats row
-      ROW2_OFFSET <- 0.044      # Notes row
-      ROW3_OFFSET <- 0.095      # Diamonds row
+      ROW2_OFFSET <- 0.050      # Notes row (expanded)
+      ROW3_OFFSET <- 0.105      # Diamonds row (adjusted for expanded notes)
       
       # Row 1 (Name, Hand, Grades, Stats) settings
       ROW1_HEIGHT <- 0.024
@@ -3314,16 +3293,18 @@ output$download_scout_pdf <- downloadHandler(
       SPRAY_PILL_WIDTH <- 0.038
       # Spray X positions: 0.888, 0.930, 0.972
       
-      # Row 2 (Notes) settings
-      ROW2_HEIGHT <- 0.032
+      # Row 2 (Notes) settings - Expanded for more notes space
+      ROW2_HEIGHT <- 0.042
       ROW2_BG <- "white"
-      NOTES_FONT_SIZE <- 6
+      NOTES_FONT_SIZE <- 5.5
       LHP_COLOR <- "#C62828"
       RHP_COLOR <- "black"
       OVERALL_COLOR <- "#1565C0"
+      MATCHUP_COLOR <- "#6A1B9A"
       LHP_X <- 0.025
-      RHP_X <- 0.345
-      OVERALL_X <- 0.665
+      RHP_X <- 0.26
+      OVERALL_X <- 0.50
+      MATCHUP_X <- 0.75
       
       # Row 3 (Diamonds) settings
       DIAMOND_SIZE <- 0.014
@@ -3457,15 +3438,19 @@ output$download_scout_pdf <- downloadHandler(
           # Grade boxes - explicit X positions (Overall, GamePwr, Contact, AvoidK, SwDec)
           grades <- c(profile$overall_grade, profile$game_power_grade, profile$contact_grade, 
                      profile$avoid_k_grade, profile$swing_dec_grade)
-          grade_labels <- c("OVR", "GPwr", "CON", "AvK", "SwD")
+          grade_labels <- c("Overall", "GamePwr", "Contact", "AvoidK", "SwDec")
           grade_x_positions <- c(0.18, 0.22, 0.26, 0.30, 0.34)
           
           for (g_idx in 1:5) {
-            grid::grid.rect(x = grade_x_positions[g_idx], y = row1_y, 
+            # Grade box with number
+            grid::grid.rect(x = grade_x_positions[g_idx], y = row1_y + 0.004, 
                            width = GRADE_BOX_WIDTH, height = GRADE_BOX_HEIGHT,
                            gp = grid::gpar(fill = grade_color_light(grades[g_idx]), col = "gray50", lwd = 0.3))
-            grid::grid.text(grades[g_idx], x = grade_x_positions[g_idx], y = row1_y, 
+            grid::grid.text(grades[g_idx], x = grade_x_positions[g_idx], y = row1_y + 0.004, 
                            gp = grid::gpar(fontsize = GRADE_FONT_SIZE, fontface = "bold"))
+            # Label below the grade box
+            grid::grid.text(grade_labels[g_idx], x = grade_x_positions[g_idx], y = row1_y - 0.008, 
+                           gp = grid::gpar(fontsize = 4, col = "gray40"))
           }
           
           # Stats pills - explicit X positions
@@ -3513,31 +3498,56 @@ output$download_scout_pdf <- downloadHandler(
                          gp = grid::gpar(fill = ROW2_BG, col = "gray80", lwd = 0.3))
           
           # Notes layout: LHP Plan | RHP Plan | Overall Notes | Matchup Notes
-          note_x_positions <- c(0.025, 0.26, 0.50, 0.75)  # LHP, RHP, Overall, Matchup
+          # Each section gets more room for longer notes
+          note_x_positions <- c(LHP_X, RHP_X, OVERALL_X, MATCHUP_X)  # LHP, RHP, Overall, Matchup
+          
+          # Two-line notes for each section
+          row2_y_line1 <- row2_y + 0.008
+          row2_y_line2 <- row2_y - 0.008
           
           if (nchar(notes$lhp_plan) > 0) {
-            lhp_text <- paste0("LHP: ", substr(notes$lhp_plan, 1, 40))
-            grid::grid.text(lhp_text, x = note_x_positions[1], y = row2_y, just = "left",
+            lhp_text_l1 <- paste0("LHP: ", substr(notes$lhp_plan, 1, 38))
+            lhp_text_l2 <- if(nchar(notes$lhp_plan) > 38) substr(notes$lhp_plan, 39, 75) else ""
+            grid::grid.text(lhp_text_l1, x = note_x_positions[1], y = row2_y_line1, just = "left",
                            gp = grid::gpar(fontsize = NOTES_FONT_SIZE, col = LHP_COLOR, fontface = "bold"))
+            if (nchar(lhp_text_l2) > 0) {
+              grid::grid.text(lhp_text_l2, x = note_x_positions[1], y = row2_y_line2, just = "left",
+                             gp = grid::gpar(fontsize = NOTES_FONT_SIZE, col = LHP_COLOR))
+            }
           }
           
           if (nchar(notes$rhp_plan) > 0) {
-            rhp_text <- paste0("RHP: ", substr(notes$rhp_plan, 1, 40))
-            grid::grid.text(rhp_text, x = note_x_positions[2], y = row2_y, just = "left",
+            rhp_text_l1 <- paste0("RHP: ", substr(notes$rhp_plan, 1, 38))
+            rhp_text_l2 <- if(nchar(notes$rhp_plan) > 38) substr(notes$rhp_plan, 39, 75) else ""
+            grid::grid.text(rhp_text_l1, x = note_x_positions[2], y = row2_y_line1, just = "left",
                            gp = grid::gpar(fontsize = NOTES_FONT_SIZE, col = RHP_COLOR, fontface = "bold"))
+            if (nchar(rhp_text_l2) > 0) {
+              grid::grid.text(rhp_text_l2, x = note_x_positions[2], y = row2_y_line2, just = "left",
+                             gp = grid::gpar(fontsize = NOTES_FONT_SIZE, col = RHP_COLOR))
+            }
           }
           
           if (nchar(notes$overall_notes) > 0) {
-            overall_text <- paste0("Notes: ", substr(notes$overall_notes, 1, 40))
-            grid::grid.text(overall_text, x = note_x_positions[3], y = row2_y, just = "left",
+            overall_text_l1 <- paste0("Notes: ", substr(notes$overall_notes, 1, 38))
+            overall_text_l2 <- if(nchar(notes$overall_notes) > 38) substr(notes$overall_notes, 39, 75) else ""
+            grid::grid.text(overall_text_l1, x = note_x_positions[3], y = row2_y_line1, just = "left",
                            gp = grid::gpar(fontsize = NOTES_FONT_SIZE, col = OVERALL_COLOR, fontface = "bold"))
+            if (nchar(overall_text_l2) > 0) {
+              grid::grid.text(overall_text_l2, x = note_x_positions[3], y = row2_y_line2, just = "left",
+                             gp = grid::gpar(fontsize = NOTES_FONT_SIZE, col = OVERALL_COLOR))
+            }
           }
           
-          # Pitcher matchup notes (if available in notes list)
+          # Pitcher matchup notes (for specific pitcher matchup info)
           if (!is.null(notes$pitcher_matchup_notes) && nchar(notes$pitcher_matchup_notes) > 0) {
-            matchup_text <- paste0("Matchup: ", substr(notes$pitcher_matchup_notes, 1, 35))
-            grid::grid.text(matchup_text, x = note_x_positions[4], y = row2_y, just = "left",
-                           gp = grid::gpar(fontsize = NOTES_FONT_SIZE, col = "#6A1B9A", fontface = "bold"))
+            matchup_text_l1 <- paste0("Matchup: ", substr(notes$pitcher_matchup_notes, 1, 35))
+            matchup_text_l2 <- if(nchar(notes$pitcher_matchup_notes) > 35) substr(notes$pitcher_matchup_notes, 36, 70) else ""
+            grid::grid.text(matchup_text_l1, x = note_x_positions[4], y = row2_y_line1, just = "left",
+                           gp = grid::gpar(fontsize = NOTES_FONT_SIZE, col = MATCHUP_COLOR, fontface = "bold"))
+            if (nchar(matchup_text_l2) > 0) {
+              grid::grid.text(matchup_text_l2, x = note_x_positions[4], y = row2_y_line2, just = "left",
+                             gp = grid::gpar(fontsize = NOTES_FONT_SIZE, col = MATCHUP_COLOR))
+            }
           }
           
           if (nchar(notes$lhp_plan) == 0 && nchar(notes$rhp_plan) == 0 && nchar(notes$overall_notes) == 0) {
@@ -3584,6 +3594,175 @@ output$download_scout_pdf <- downloadHandler(
         # === FOOTER ===
         grid::grid.text("Data: TrackMan | Generated: Coastal Carolina Baseball Analytics", x = 0.5, y = FOOTER_Y,
                        gp = grid::gpar(fontsize = FOOTER_FONT_SIZE, col = "gray50", fontface = "italic"))
+      }
+      
+      # ============================================================
+      # ADVANCED HEATMAP PAGES - One page per hitter with stat/sample grid
+      # ============================================================
+      
+      # Helper function to draw a mini heatmap cell with stat and sample overlay
+      draw_heatmap_cell <- function(cx, cy, cell_width, cell_height, stat_val, n_sample, 
+                                   stat_type = "whiff", highlight_color = "#FF6666") {
+        # Draw cell background
+        bg_color <- if(is.na(stat_val)) "#f5f5f5" else {
+          # Color based on stat type and value
+          benchmarks <- list(pitch_freq = NA, swing = 48, woba = 0.320, damage = 35, 
+                            chase = 28, whiff = 25, iz_whiff = 15, iz_damage = 35)
+          higher_better <- list(pitch_freq = TRUE, swing = TRUE, woba = TRUE, damage = TRUE, 
+                               chase = FALSE, whiff = FALSE, iz_whiff = FALSE, iz_damage = TRUE)
+          bm <- benchmarks[[stat_type]]
+          hb <- higher_better[[stat_type]]
+          if (is.na(bm)) "#f8f8f8" else {
+            pct_diff <- if(hb) (stat_val - bm) / abs(bm) * 100 else (bm - stat_val) / abs(bm) * 100
+            if (pct_diff > 10) "#C8E6C9" else if (pct_diff > 0) "#DCEDC8" else if (pct_diff >= -10) "#FFF9C4" else "#FFCDD2"
+          }
+        }
+        
+        # Cell background
+        grid::grid.rect(x = cx, y = cy, width = cell_width, height = cell_height,
+                       gp = grid::gpar(fill = bg_color, col = "gray60", lwd = 0.3))
+        
+        # Strike zone mini box
+        zone_size <- min(cell_width, cell_height) * 0.4
+        grid::grid.rect(x = cx, y = cy + cell_height * 0.1, width = zone_size, height = zone_size * 1.1,
+                       gp = grid::gpar(fill = NA, col = "black", lwd = 0.5))
+        
+        # Stat value
+        stat_text <- if(is.na(stat_val)) "-" else {
+          if(stat_type == "pitch_freq") sprintf("%.0f", stat_val)
+          else if(stat_type == "woba") sprintf("%.3f", stat_val)
+          else sprintf("%.1f%%", stat_val)
+        }
+        grid::grid.text(stat_text, x = cx, y = cy + cell_height * 0.1, 
+                       gp = grid::gpar(fontsize = 7, fontface = "bold", col = "#333"))
+        
+        # Sample size
+        grid::grid.text(paste0("n=", n_sample), x = cx, y = cy - cell_height * 0.3,
+                       gp = grid::gpar(fontsize = 5, col = "gray50"))
+      }
+      
+      # Generate advanced heatmap page for each hitter
+      for (h_name in names(data)) {
+        grid::grid.newpage()
+        
+        profile <- data[[h_name]]$profile
+        short_name <- format_short_name(h_name)
+        hand_label <- format_batter_hand(profile$hand)
+        
+        # === PAGE HEADER ===
+        grid::grid.rect(x = 0.5, y = 0.975, width = 1, height = 0.045, 
+                       gp = grid::gpar(fill = "#006F71", col = NA))
+        grid::grid.text(paste0("ADVANCED HEATMAPS: ", short_name, " ", hand_label), 
+                       x = 0.5, y = 0.975, 
+                       gp = grid::gpar(fontsize = 12, fontface = "bold", col = "white"))
+        grid::grid.text(format(Sys.Date(), "%m/%d/%Y"), x = 0.95, y = 0.975, just = "right",
+                       gp = grid::gpar(fontsize = 8, col = "white"))
+        
+        # === PITCH TYPE GRID (TOP HALF) ===
+        grid::grid.text("vs RHP - By Pitch Type", x = 0.5, y = 0.92, 
+                       gp = grid::gpar(fontsize = 10, fontface = "bold", col = "#006F71"))
+        
+        # Column headers
+        stat_cols <- c("Pitch Freq", "Swing%", "wOBA", "Damage", "Chase%", "Whiff%", "IZ Whiff%", "IZ Damage%")
+        stat_types_pdf <- c("pitch_freq", "swing", "woba", "damage", "chase", "whiff", "iz_whiff", "iz_damage")
+        col_width <- 0.1
+        col_start_x <- 0.18
+        
+        for (s_idx in seq_along(stat_cols)) {
+          grid::grid.text(stat_cols[s_idx], x = col_start_x + (s_idx - 0.5) * col_width, y = 0.90,
+                         gp = grid::gpar(fontsize = 6, fontface = "bold", col = "#006F71"))
+        }
+        
+        # Row labels and data for pitch types
+        pitch_rows <- c("4S", "2S/Si", "SL/SW", "CB", "CH/Spl", "Overall")
+        row_height <- 0.065
+        row_start_y <- 0.85
+        
+        # Get stats from cache for RHP
+        pitch_stats_rhp <- get_advanced_heatmap_stats(h_name, "Right", "pitch_type")
+        
+        for (r_idx in seq_along(pitch_rows)) {
+          row_y <- row_start_y - (r_idx - 1) * row_height
+          
+          # Row label
+          grid::grid.text(pitch_rows[r_idx], x = 0.08, y = row_y,
+                         gp = grid::gpar(fontsize = 7, fontface = "bold"))
+          
+          # Get stats for this row
+          row_stat <- NULL
+          for (ps in pitch_stats_rhp) {
+            if (!is.null(ps$pitch_type) && ps$pitch_type == pitch_rows[r_idx]) {
+              row_stat <- ps
+              break
+            }
+          }
+          
+          n_sample <- if(!is.null(row_stat)) row_stat$n else 0
+          
+          # Draw cells for each stat
+          stat_values <- if(!is.null(row_stat)) {
+            c(row_stat$n, row_stat$swing_pct, row_stat$woba, row_stat$damage_pct,
+              row_stat$chase_pct, row_stat$whiff_pct, row_stat$iz_whiff_pct, row_stat$iz_damage_pct)
+          } else rep(NA, 8)
+          
+          for (s_idx in seq_along(stat_types_pdf)) {
+            cell_x <- col_start_x + (s_idx - 0.5) * col_width
+            draw_heatmap_cell(cell_x, row_y, col_width * 0.9, row_height * 0.85, 
+                             stat_values[s_idx], n_sample, stat_types_pdf[s_idx])
+          }
+        }
+        
+        # === COUNT TYPE GRID (BOTTOM HALF) ===
+        grid::grid.text("vs RHP - By Count", x = 0.5, y = 0.42, 
+                       gp = grid::gpar(fontsize = 10, fontface = "bold", col = "#006F71"))
+        
+        # Column headers for count grid
+        for (s_idx in seq_along(stat_cols)) {
+          grid::grid.text(stat_cols[s_idx], x = col_start_x + (s_idx - 0.5) * col_width, y = 0.40,
+                         gp = grid::gpar(fontsize = 6, fontface = "bold", col = "#006F71"))
+        }
+        
+        # Row labels and data for count types
+        count_rows <- c("1P", "2K", "Ahead", "Behind", "Last 15")
+        count_start_y <- 0.35
+        
+        # Get stats from cache for RHP count data
+        count_stats_rhp <- get_advanced_heatmap_stats(h_name, "Right", "count_type")
+        
+        for (r_idx in seq_along(count_rows)) {
+          row_y <- count_start_y - (r_idx - 1) * row_height
+          
+          # Row label
+          grid::grid.text(count_rows[r_idx], x = 0.08, y = row_y,
+                         gp = grid::gpar(fontsize = 7, fontface = "bold"))
+          
+          # Get stats for this row
+          row_stat <- NULL
+          for (cs in count_stats_rhp) {
+            if (!is.null(cs$count_type) && cs$count_type == count_rows[r_idx]) {
+              row_stat <- cs
+              break
+            }
+          }
+          
+          n_sample <- if(!is.null(row_stat)) row_stat$n else 0
+          
+          # Draw cells for each stat
+          stat_values <- if(!is.null(row_stat)) {
+            c(row_stat$n, row_stat$swing_pct, row_stat$woba, row_stat$damage_pct,
+              row_stat$chase_pct, row_stat$whiff_pct, row_stat$iz_whiff_pct, row_stat$iz_damage_pct)
+          } else rep(NA, 8)
+          
+          for (s_idx in seq_along(stat_types_pdf)) {
+            cell_x <- col_start_x + (s_idx - 0.5) * col_width
+            draw_heatmap_cell(cell_x, row_y, col_width * 0.9, row_height * 0.85, 
+                             stat_values[s_idx], n_sample, stat_types_pdf[s_idx])
+          }
+        }
+        
+        # Footer
+        grid::grid.text("Data: TrackMan | Coastal Carolina Baseball Analytics", x = 0.5, y = 0.02,
+                       gp = grid::gpar(fontsize = 6, col = "gray50", fontface = "italic"))
       }
       
       dev.off()
