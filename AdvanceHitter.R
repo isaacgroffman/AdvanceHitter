@@ -1,10 +1,3 @@
-# ============================================================================
-# HITTER SCOUTING CARDS APP - Streamlined Version
-# With MAC (Matchup Analysis using Clustering) Methodology
-# Based on: "Using Euclidean Distance and Clustering to quantify matchups"
-# by Chap Cunningham and Zack Aisen (Saber Seminar 2025)
-# ============================================================================
-
 library(shiny)
 library(shinydashboard)
 library(shinyWidgets)
@@ -15,7 +8,6 @@ library(grid)
 library(scales)
 library(arrow)
 library(httr)
-library(xgboost)  # For xRV predictive model
 
 # Suppress jsonlite warnings about named vectors (cosmetic, doesn't affect functionality)
 options(shiny.sanitize.errors = FALSE)
@@ -152,9 +144,7 @@ required_cols <- c(
   # Pre-calculated metrics (from TM2025)
   "mean_DRE_bat", "woba", "wobacon", "slg",
   "is_put_away", "is_walk", "is_ab", "is_hit",
-  "in_zone", "in_zone_whiff", "is_whiff", "is_swing", "chase", "is_pa", "is_k",
-  # Pitch characteristics (for MAC matchup)
-  "RelSpeed", "InducedVertBreak", "HorzBreak", "SpinRate", "RelHeight", "RelSide"
+  "in_zone", "in_zone_whiff", "is_whiff", "is_swing", "chase", "is_pa", "is_k"
 )
 
 # Helper function to select only existing columns
@@ -279,17 +269,6 @@ add_indicators <- function(df) {
 
 tm_data <- add_indicators(tm_data)
 
-# Ensure all required columns exist in tm_data with proper defaults
-# This fixes the ifelse() bug where scalar conditions return only the first element
-if (!"mean_DRE_bat" %in% names(tm_data)) tm_data$mean_DRE_bat <- 0
-if (!"mean_DRE_pit" %in% names(tm_data)) tm_data$mean_DRE_pit <- 0  # Pitcher run value
-if (!"RelSpeed" %in% names(tm_data)) tm_data$RelSpeed <- 85
-if (!"InducedVertBreak" %in% names(tm_data)) tm_data$InducedVertBreak <- 12
-if (!"HorzBreak" %in% names(tm_data)) tm_data$HorzBreak <- 0
-if (!"SpinRate" %in% names(tm_data)) tm_data$SpinRate <- 2200
-if (!"RelHeight" %in% names(tm_data)) tm_data$RelHeight <- 6
-if (!"RelSide" %in% names(tm_data)) tm_data$RelSide <- 0
-
 all_hitters <- sort(unique(tm_data$Batter))
 
 # Create SEC pool for percentile comparisons (optimized - select only needed columns)
@@ -309,685 +288,6 @@ sec_pool_data <- tm_data %>%
 d1_pool_data <- tm_data
 
 # Clean up memory
-gc(verbose = FALSE)
-
-# ============================================================================
-# PITCHER ARSENAL AND BATTER PITCH PERFORMANCE DATA FOR MAC MATCHUP
-# ============================================================================
-
-# Create pitcher arsenal summary with run value
-# Note: Direct column references used instead of ifelse() to avoid scalar condition bug
-pitcher_arsenal <- tm_data %>%
-  filter(!is.na(TaggedPitchType)) %>%
-  mutate(PitchFamily = classify_pitch_family(TaggedPitchType)) %>%
-  group_by(Pitcher, PitcherThrows, PitchFamily) %>%
-  summarise(
-    n = n(),
-    RelSpeed = mean(RelSpeed, na.rm = TRUE),
-    InducedVertBreak = mean(InducedVertBreak, na.rm = TRUE),
-    HorzBreak = mean(HorzBreak, na.rm = TRUE),
-    SpinRate = mean(SpinRate, na.rm = TRUE),
-    RelHeight = mean(RelHeight, na.rm = TRUE),
-    RelSide = mean(RelSide, na.rm = TRUE),
-    mean_DRE_pit = mean(mean_DRE_pit, na.rm = TRUE),  # Pitcher run value
-    .groups = "drop"
-  ) %>%
-  filter(n >= 10) %>%
-  group_by(Pitcher) %>%
-  mutate(usage_pct = n / sum(n)) %>%
-  ungroup()
-
-# Calculate feature means and standard deviations for standardization
-feature_means <- list(
-  RelSpeed = mean(pitcher_arsenal$RelSpeed, na.rm = TRUE),
-  InducedVertBreak = mean(pitcher_arsenal$InducedVertBreak, na.rm = TRUE),
-  HorzBreak = mean(pitcher_arsenal$HorzBreak, na.rm = TRUE),
-  SpinRate = mean(pitcher_arsenal$SpinRate, na.rm = TRUE),
-  RelHeight = mean(pitcher_arsenal$RelHeight, na.rm = TRUE),
-  RelSide = mean(pitcher_arsenal$RelSide, na.rm = TRUE)
-)
-
-feature_sds <- list(
-  RelSpeed = sd(pitcher_arsenal$RelSpeed, na.rm = TRUE),
-  InducedVertBreak = sd(pitcher_arsenal$InducedVertBreak, na.rm = TRUE),
-  HorzBreak = sd(pitcher_arsenal$HorzBreak, na.rm = TRUE),
-  SpinRate = sd(pitcher_arsenal$SpinRate, na.rm = TRUE),
-  RelHeight = sd(pitcher_arsenal$RelHeight, na.rm = TRUE),
-  RelSide = sd(pitcher_arsenal$RelSide, na.rm = TRUE)
-)
-
-# Replace any NA/zero SDs with 1 to avoid division errors
-feature_sds <- lapply(feature_sds, function(x) if(is.na(x) || x == 0) 1 else x)
-
-cat("Memory used after pitcher arsenal:", round(sum(gc()[,2]), 1), "MB\n")
-
-# Create batter pitch performance data with standardized features (optimized)
-# Note: Direct column references used instead of ifelse() to avoid scalar condition bug
-batter_pitch_performance <- tm_data %>%
-  filter(!is.na(TaggedPitchType)) %>%
-  mutate(
-    PitchFamily = classify_pitch_family(TaggedPitchType),
-    hitter_rv = mean_DRE_bat,
-    # Standardize features using columns (now guaranteed to exist)
-    RelSpeed_z = (RelSpeed - feature_means$RelSpeed) / feature_sds$RelSpeed,
-    IVB_z = (InducedVertBreak - feature_means$InducedVertBreak) / feature_sds$InducedVertBreak,
-    HB_z = (HorzBreak - feature_means$HorzBreak) / feature_sds$HorzBreak,
-    SpinRate_z = (SpinRate - feature_means$SpinRate) / feature_sds$SpinRate,
-    RelHeight_z = (RelHeight - feature_means$RelHeight) / feature_sds$RelHeight,
-    RelSide_z = (RelSide - feature_means$RelSide) / feature_sds$RelSide,
-    # Use indicator columns (already added by add_indicators)
-    SwingIndicator = is_swing,
-    WhiffIndicator = is_whiff,
-    ABindicator = is_ab,
-    HitIndicator = is_hit,
-    PAindicator = is_pa,
-    KorBB = case_when(
-      is_k == 1 ~ "Strikeout",
-      is_walk == 1 ~ "Walk",
-      TRUE ~ NA_character_
-    ),
-    totalbases = case_when(
-      PlayResult == "HomeRun" ~ 4,
-      PlayResult == "Triple" ~ 3,
-      PlayResult == "Double" ~ 2,
-      PlayResult == "Single" ~ 1,
-      TRUE ~ 0
-    )
-  )
-
-# Get list of all pitchers for dropdown
-all_pitchers <- sort(unique(tm_data$Pitcher))
-
-# ============================================================================
-# PRE-COMPUTE STANDARDIZED BATTER DATA FOR MAC (MEMORY OPTIMIZED)
-# ============================================================================
-# Pre-compute z-scores and safe values to avoid recalculating during matchup queries
-
-batter_pitch_performance <- batter_pitch_performance %>%
-  mutate(
-    # Pre-compute safe z-scores for MAC distance calculation (coalesce NA to 0)
-    RelSpeed_z_safe = coalesce(RelSpeed_z, 0),
-    IVB_z_safe = coalesce(IVB_z, 0),
-    HB_z_safe = coalesce(HB_z, 0),
-    SpinRate_z_safe = coalesce(SpinRate_z, 0),
-    RelHeight_z_safe = coalesce(RelHeight_z, 0),
-    RelSide_z_safe = coalesce(RelSide_z, 0)
-  )
-
-# Force garbage collection after adding columns
-gc(verbose = FALSE)
-
-# ============================================================================
-# PRE-BIN BATTER PERFORMANCE AGAINST PITCH PROFILES AT STARTUP
-# ============================================================================
-# This pre-computation reduces model load times by caching aggregated stats
-
-cat("Pre-binning batter performance against pitch profiles...\n")
-
-# Define pitch type groups for advanced heat maps
-classify_detailed_pitch <- function(pitch_type) {
-  case_when(
-    pitch_type %in% c("Fastball", "Four-Seam", "FourSeamFastBall", "FF") ~ "4S",
-    pitch_type %in% c("TwoSeamFastBall", "Sinker", "SI", "FT") ~ "2S/Si",
-    pitch_type %in% c("Slider", "Sweeper", "SL", "SW") ~ "SL/SW",
-    pitch_type %in% c("Curveball", "Cutter", "CU", "CB", "KC", "FC", "SV") ~ "CB",
-    pitch_type %in% c("Changeup", "ChangeUp", "Splitter", "CH", "FS", "SP") ~ "CH/Spl",
-    TRUE ~ "Other"
-  )
-}
-
-# Add detailed pitch classification to batter_pitch_performance
-batter_pitch_performance <- batter_pitch_performance %>%
-  mutate(DetailedPitchType = classify_detailed_pitch(TaggedPitchType))
-
-# Pre-bin batter performance by pitch type and pitcher hand
-batter_pitch_profile_cache <- batter_pitch_performance %>%
-  filter(!is.na(Batter), !is.na(PitcherThrows)) %>%
-  group_by(Batter, PitcherThrows, DetailedPitchType) %>%
-  summarise(
-    n_pitches = n(),
-    n_swings = sum(SwingIndicator, na.rm = TRUE),
-    n_whiffs = sum(WhiffIndicator, na.rm = TRUE),
-    n_in_zone = sum(in_zone, na.rm = TRUE),
-    n_out_zone = sum(out_of_zone, na.rm = TRUE),
-    n_chase = sum(chase, na.rm = TRUE),
-    n_iz_swing = sum(z_swing, na.rm = TRUE),
-    n_iz_whiff = sum(in_zone_whiff, na.rm = TRUE),
-    n_bip = sum(PitchCall == "InPlay", na.rm = TRUE),
-    n_damage = sum(PitchCall == "InPlay" & ExitSpeed >= 95, na.rm = TRUE),
-    woba_sum = sum(woba, na.rm = TRUE),
-    woba_n = sum(!is.na(woba)),
-    rv_sum = sum(mean_DRE_bat, na.rm = TRUE),
-    .groups = "drop"
-  ) %>%
-  mutate(
-    pitch_freq = n_pitches,
-    swing_pct = ifelse(n_pitches > 0, 100 * n_swings / n_pitches, NA),
-    whiff_pct = ifelse(n_swings > 0, 100 * n_whiffs / n_swings, NA),
-    woba = ifelse(woba_n > 0, woba_sum / woba_n, NA),
-    damage_pct = ifelse(n_bip > 0, 100 * n_damage / n_bip, NA),
-    chase_pct = ifelse(n_out_zone > 0, 100 * n_chase / n_out_zone, NA),
-    iz_whiff_pct = ifelse(n_iz_swing > 0, 100 * n_iz_whiff / n_iz_swing, NA),
-    iz_damage_pct = ifelse(n_in_zone > 0, 100 * n_damage / pmax(1, n_bip), NA)
-  )
-
-# Pre-bin batter performance by count type and pitcher hand
-batter_count_profile_cache <- batter_pitch_performance %>%
-  filter(!is.na(Batter), !is.na(PitcherThrows)) %>%
-  mutate(
-    CountType = case_when(
-      Balls == 0 & Strikes == 0 ~ "1P",
-      Strikes == 2 ~ "2K",
-      Strikes > Balls ~ "Ahead",
-      Balls > Strikes ~ "Behind",
-      TRUE ~ "Even"
-    )
-  ) %>%
-  group_by(Batter, PitcherThrows, CountType) %>%
-  summarise(
-    n_pitches = n(),
-    n_swings = sum(SwingIndicator, na.rm = TRUE),
-    n_whiffs = sum(WhiffIndicator, na.rm = TRUE),
-    n_in_zone = sum(in_zone, na.rm = TRUE),
-    n_out_zone = sum(out_of_zone, na.rm = TRUE),
-    n_chase = sum(chase, na.rm = TRUE),
-    n_iz_swing = sum(z_swing, na.rm = TRUE),
-    n_iz_whiff = sum(in_zone_whiff, na.rm = TRUE),
-    n_bip = sum(PitchCall == "InPlay", na.rm = TRUE),
-    n_damage = sum(PitchCall == "InPlay" & ExitSpeed >= 95, na.rm = TRUE),
-    woba_sum = sum(woba, na.rm = TRUE),
-    woba_n = sum(!is.na(woba)),
-    rv_sum = sum(mean_DRE_bat, na.rm = TRUE),
-    .groups = "drop"
-  ) %>%
-  mutate(
-    pitch_freq = n_pitches,
-    swing_pct = ifelse(n_pitches > 0, 100 * n_swings / n_pitches, NA),
-    whiff_pct = ifelse(n_swings > 0, 100 * n_whiffs / n_swings, NA),
-    woba = ifelse(woba_n > 0, woba_sum / woba_n, NA),
-    damage_pct = ifelse(n_bip > 0, 100 * n_damage / n_bip, NA),
-    chase_pct = ifelse(n_out_zone > 0, 100 * n_chase / n_out_zone, NA),
-    iz_whiff_pct = ifelse(n_iz_swing > 0, 100 * n_iz_whiff / n_iz_swing, NA),
-    iz_damage_pct = ifelse(n_in_zone > 0, 100 * n_damage / pmax(1, n_bip), NA)
-  )
-
-# Pre-compute last 15 games data for each batter
-batter_last15_cache <- batter_pitch_performance %>%
-  filter(!is.na(Batter), !is.na(Date)) %>%
-  group_by(Batter) %>%
-  arrange(desc(as.Date(Date))) %>%
-  mutate(game_rank = dense_rank(desc(as.Date(Date)))) %>%
-  filter(game_rank <= 15) %>%
-  group_by(Batter, PitcherThrows) %>%
-  summarise(
-    n_pitches = n(),
-    n_swings = sum(SwingIndicator, na.rm = TRUE),
-    n_whiffs = sum(WhiffIndicator, na.rm = TRUE),
-    n_in_zone = sum(in_zone, na.rm = TRUE),
-    n_out_zone = sum(out_of_zone, na.rm = TRUE),
-    n_chase = sum(chase, na.rm = TRUE),
-    n_iz_swing = sum(z_swing, na.rm = TRUE),
-    n_iz_whiff = sum(in_zone_whiff, na.rm = TRUE),
-    n_bip = sum(PitchCall == "InPlay", na.rm = TRUE),
-    n_damage = sum(PitchCall == "InPlay" & ExitSpeed >= 95, na.rm = TRUE),
-    woba_sum = sum(woba, na.rm = TRUE),
-    woba_n = sum(!is.na(woba)),
-    .groups = "drop"
-  ) %>%
-  mutate(
-    pitch_freq = n_pitches,
-    swing_pct = ifelse(n_pitches > 0, 100 * n_swings / n_pitches, NA),
-    whiff_pct = ifelse(n_swings > 0, 100 * n_whiffs / n_swings, NA),
-    woba = ifelse(woba_n > 0, woba_sum / woba_n, NA),
-    damage_pct = ifelse(n_bip > 0, 100 * n_damage / n_bip, NA),
-    chase_pct = ifelse(n_out_zone > 0, 100 * n_chase / n_out_zone, NA),
-    iz_whiff_pct = ifelse(n_iz_swing > 0, 100 * n_iz_whiff / n_iz_swing, NA),
-    iz_damage_pct = ifelse(n_in_zone > 0, 100 * n_damage / pmax(1, n_bip), NA)
-  )
-
-# Pre-compute overall batter stats by pitcher hand
-batter_overall_cache <- batter_pitch_performance %>%
-  filter(!is.na(Batter), !is.na(PitcherThrows)) %>%
-  group_by(Batter, PitcherThrows) %>%
-  summarise(
-    n_pitches = n(),
-    n_swings = sum(SwingIndicator, na.rm = TRUE),
-    n_whiffs = sum(WhiffIndicator, na.rm = TRUE),
-    n_in_zone = sum(in_zone, na.rm = TRUE),
-    n_out_zone = sum(out_of_zone, na.rm = TRUE),
-    n_chase = sum(chase, na.rm = TRUE),
-    n_iz_swing = sum(z_swing, na.rm = TRUE),
-    n_iz_whiff = sum(in_zone_whiff, na.rm = TRUE),
-    n_bip = sum(PitchCall == "InPlay", na.rm = TRUE),
-    n_damage = sum(PitchCall == "InPlay" & ExitSpeed >= 95, na.rm = TRUE),
-    woba_sum = sum(woba, na.rm = TRUE),
-    woba_n = sum(!is.na(woba)),
-    .groups = "drop"
-  ) %>%
-  mutate(
-    pitch_freq = n_pitches,
-    swing_pct = ifelse(n_pitches > 0, 100 * n_swings / n_pitches, NA),
-    whiff_pct = ifelse(n_swings > 0, 100 * n_whiffs / n_swings, NA),
-    woba = ifelse(woba_n > 0, woba_sum / woba_n, NA),
-    damage_pct = ifelse(n_bip > 0, 100 * n_damage / n_bip, NA),
-    chase_pct = ifelse(n_out_zone > 0, 100 * n_chase / n_out_zone, NA),
-    iz_whiff_pct = ifelse(n_iz_swing > 0, 100 * n_iz_whiff / n_iz_swing, NA),
-    iz_damage_pct = ifelse(n_in_zone > 0, 100 * n_damage / pmax(1, n_bip), NA)
-  )
-
-cat("Pre-binned performance data for", n_distinct(batter_pitch_profile_cache$Batter), "batters\n")
-cat("  - Pitch type profiles:", nrow(batter_pitch_profile_cache), "records\n")
-cat("  - Count profiles:", nrow(batter_count_profile_cache), "records\n")
-cat("  - Last 15 games:", nrow(batter_last15_cache), "records\n")
-
-# Memory cleanup after initial data processing
-cat("Data loading complete. Memory cleanup...\n")
-gc(verbose = FALSE)
-cat("Final memory usage:", round(sum(gc()[,2]), 1), "MB\n")
-cat("Loaded", nrow(tm_data), "pitch records for", length(all_hitters), "hitters and", length(all_pitchers), "pitchers\n")
-
-# ============================================================================
-# MAC-STYLE MATCHUP CALCULATION FUNCTION (Euclidean Distance with 0.6 threshold)
-# Based on: "Using Euclidean Distance and Clustering to quantify batter vs. pitcher matchups"
-# by Chap Cunningham and Zack Aisen (Saber Seminar 2025)
-# ============================================================================
-
-# MAC Distance threshold - 0.6 is the "sweet spot" per the article
-MAC_DISTANCE_THRESHOLD <- 0.6
-
-# Vectorized Euclidean distance calculation for efficiency
-calculate_euclidean_distance_vectorized <- function(batter_df, target) {
-  sqrt(
-    (batter_df$RelSpeed_z_safe - target$RelSpeed_z)^2 +
-    (batter_df$IVB_z_safe - target$IVB_z)^2 +
-    (batter_df$HB_z_safe - target$HB_z)^2 +
-    (batter_df$SpinRate_z_safe - target$SpinRate_z)^2 +
-    (batter_df$RelHeight_z_safe - target$RelHeight_z)^2 +
-    (batter_df$RelSide_z_safe - target$RelSide_z)^2
-  )
-}
-
-# Convert RV/100 to 0-100 MAC score
-# 0 = Strong Hitter Advantage, 50 = Neutral, 100 = Strong Pitcher Advantage
-rv100_to_mac_score <- function(rv100, n_similar) {
-  if (is.na(rv100) || n_similar < 5) return(50)
-  
-  # Apply confidence adjustment based on sample size
-  # More samples = more confident in the score
-  confidence <- min(1, n_similar / 100)
-  
-  # Scale: RV/100 of +3 = 0 (strong hitter), -3 = 100 (strong pitcher)
-  # Center at 50, scale by 16.67 per run value
-  raw_score <- 50 - (rv100 * 16.67)
-  
-  # Apply confidence - pull toward 50 if low sample
-  adjusted_score <- 50 + (raw_score - 50) * confidence
-  
-  # Clamp to 0-100
-  round(max(0, min(100, adjusted_score)))
-}
-
-calculate_mac_matchup <- function(p_name, h_name, distance_threshold = MAC_DISTANCE_THRESHOLD) {
-  # Get pitcher's arsenal
-  p_arsenal <- pitcher_arsenal %>% filter(Pitcher == p_name)
-  
-  if (nrow(p_arsenal) == 0) {
-    return(list(
-      score = 50, rv100 = 0, n_similar = 0, by_pitch = NULL,
-      whiff_pct = NA, chase_pct = NA, woba = NA, damage_pct = NA,
-      confidence = "Low"
-    ))
-  }
-  
-  p_hand <- p_arsenal$PitcherThrows[1]
-  
-  # Get batter's pitch history - FILTER BY SAME PITCHER HAND
-  batter_pitches <- batter_pitch_performance %>%
-    filter(Batter == h_name, PitcherThrows == p_hand)
-  
-  if (nrow(batter_pitches) < 20) {
-    return(list(
-      score = 50, rv100 = 0, n_similar = 0, by_pitch = NULL,
-      whiff_pct = NA, chase_pct = NA, woba = NA, damage_pct = NA,
-      confidence = "Low"
-    ))
-  }
-  
-  # Use pre-computed safe z-scores (no need to recalculate - already done at startup)
-  batter_pitches_safe <- batter_pitches
-  
-  # For each pitch type in pitcher's arsenal, find similar pitches batter has faced
-  results_by_pitch <- list()
-  all_similar_pitches <- data.frame()
-  total_similar <- 0
-  
-  for (i in 1:nrow(p_arsenal)) {
-    pitch_type <- p_arsenal$PitchFamily[i]
-    usage <- p_arsenal$usage_pct[i]
-    
-    # Target pitch profile (standardized) - from MAC scanning features
-    target <- list(
-      RelSpeed_z = coalesce((p_arsenal$RelSpeed[i] - feature_means$RelSpeed) / feature_sds$RelSpeed, 0),
-      IVB_z = coalesce((p_arsenal$InducedVertBreak[i] - feature_means$InducedVertBreak) / feature_sds$InducedVertBreak, 0),
-      HB_z = coalesce((p_arsenal$HorzBreak[i] - feature_means$HorzBreak) / feature_sds$HorzBreak, 0),
-      SpinRate_z = coalesce((p_arsenal$SpinRate[i] - feature_means$SpinRate) / feature_sds$SpinRate, 0),
-      RelHeight_z = coalesce((p_arsenal$RelHeight[i] - feature_means$RelHeight) / feature_sds$RelHeight, 0),
-      RelSide_z = coalesce((p_arsenal$RelSide[i] - feature_means$RelSide) / feature_sds$RelSide, 0)
-    )
-    
-    # Vectorized distance calculation for efficiency
-    distances <- calculate_euclidean_distance_vectorized(batter_pitches_safe, target)
-    
-    # Filter to similar pitches using MAC threshold (0.6)
-    similar_mask <- !is.na(distances) & distances <= distance_threshold
-    similar_pitches <- batter_pitches_safe[similar_mask, ]
-    similar_pitches$distance <- distances[similar_mask]
-    similar_pitches$pitcher_pitch_type <- pitch_type
-    
-    n_similar_pitch <- nrow(similar_pitches)
-    
-    if (n_similar_pitch >= 5) {
-      # Calculate metrics on similar pitches
-      rv100_similar <- 100 * mean(similar_pitches$hitter_rv, na.rm = TRUE)
-      whiff_pct <- 100 * mean(similar_pitches$WhiffIndicator, na.rm = TRUE)
-      chase_pct <- 100 * mean(similar_pitches$chase[similar_pitches$out_of_zone == 1], na.rm = TRUE)
-      woba <- mean(similar_pitches$woba, na.rm = TRUE)
-      damage_pct <- 100 * mean(similar_pitches$ExitSpeed >= 95, na.rm = TRUE)
-      
-      # Apply shrinkage based on sample size (Bayesian approach)
-      k <- 50  # Shrinkage factor
-      shrinkage <- n_similar_pitch / (n_similar_pitch + k)
-      rv100_shrunk <- shrinkage * rv100_similar + (1 - shrinkage) * 0
-      
-      results_by_pitch[[pitch_type]] <- list(
-        n = n_similar_pitch,
-        rv100 = rv100_shrunk,
-        rv100_raw = rv100_similar,
-        usage = usage,
-        whiff_pct = whiff_pct,
-        chase_pct = if(is.nan(chase_pct)) NA else chase_pct,
-        woba = woba,
-        damage_pct = damage_pct
-      )
-      total_similar <- total_similar + n_similar_pitch
-      all_similar_pitches <- rbind(all_similar_pitches, similar_pitches)
-    } else {
-      results_by_pitch[[pitch_type]] <- list(
-        n = n_similar_pitch,
-        rv100 = 0,
-        rv100_raw = NA,
-        usage = usage,
-        whiff_pct = NA,
-        chase_pct = NA,
-        woba = NA,
-        damage_pct = NA
-      )
-    }
-  }
-  
-  # Calculate usage-weighted RV/100 (MAC methodology)
-  weighted_rv100 <- 0
-  total_usage_weight <- 0
-  
-  for (pt in names(results_by_pitch)) {
-    pitch_data <- results_by_pitch[[pt]]
-    usage <- pitch_data$usage
-    
-    if (pitch_data$n >= 5 && !is.na(pitch_data$rv100_raw)) {
-      # Weight by usage percentage
-      weighted_rv100 <- weighted_rv100 + pitch_data$rv100 * usage
-      total_usage_weight <- total_usage_weight + usage
-    }
-  }
-  
-  if (total_usage_weight > 0) {
-    weighted_rv100 <- weighted_rv100 / total_usage_weight
-  } else {
-    weighted_rv100 <- 0
-  }
-  
-  # Calculate overall stats from all similar pitches
-  overall_whiff <- if(nrow(all_similar_pitches) > 0) 100 * mean(all_similar_pitches$WhiffIndicator, na.rm = TRUE) else NA
-  overall_chase <- if(nrow(all_similar_pitches) > 0) 100 * mean(all_similar_pitches$chase[all_similar_pitches$out_of_zone == 1], na.rm = TRUE) else NA
-  overall_woba <- if(nrow(all_similar_pitches) > 0) mean(all_similar_pitches$woba, na.rm = TRUE) else NA
-  overall_damage <- if(nrow(all_similar_pitches) > 0) 100 * mean(all_similar_pitches$ExitSpeed >= 95, na.rm = TRUE) else NA
-  
-  # Convert to MAC 0-100 score
-  final_score <- rv100_to_mac_score(weighted_rv100, total_similar)
-  
-  # Confidence level based on sample size
-  confidence <- if(total_similar < 30) "Low" else if(total_similar < 100) "Medium" else "High"
-  
-  list(
-    score = final_score,
-    rv100 = round(weighted_rv100, 2),
-    n_similar = total_similar,
-    by_pitch = results_by_pitch,
-    whiff_pct = round(overall_whiff, 1),
-    chase_pct = if(is.nan(overall_chase)) NA else round(overall_chase, 1),
-    woba = round(overall_woba, 3),
-    damage_pct = round(overall_damage, 1),
-    confidence = confidence
-  )
-}
-
-# Calculate pitch type specific matchup (FB, BB, OS) using MAC methodology
-calculate_pitch_type_matchup <- function(p_name, h_name, pitch_family, distance_threshold = MAC_DISTANCE_THRESHOLD) {
-  # Get pitcher's arsenal for specific pitch type
-  p_arsenal <- pitcher_arsenal %>% filter(Pitcher == p_name, PitchFamily == pitch_family)
-  
-  if (nrow(p_arsenal) == 0) {
-    return(list(score = 50, rv100 = 0, n_similar = 0, whiff_pct = NA, chase_pct = NA, woba = NA))
-  }
-  
-  p_hand <- p_arsenal$PitcherThrows[1]
-  
-  # Get batter's pitch history - FILTER BY SAME PITCHER HAND
-  batter_pitches <- batter_pitch_performance %>%
-    filter(Batter == h_name, PitcherThrows == p_hand)
-  
-  if (nrow(batter_pitches) < 20) {
-    return(list(score = 50, rv100 = 0, n_similar = 0, whiff_pct = NA, chase_pct = NA, woba = NA))
-  }
-  
-  # Target pitch profile (standardized) - MAC scanning features
-  target <- list(
-    RelSpeed_z = coalesce((p_arsenal$RelSpeed[1] - feature_means$RelSpeed) / feature_sds$RelSpeed, 0),
-    IVB_z = coalesce((p_arsenal$InducedVertBreak[1] - feature_means$InducedVertBreak) / feature_sds$InducedVertBreak, 0),
-    HB_z = coalesce((p_arsenal$HorzBreak[1] - feature_means$HorzBreak) / feature_sds$HorzBreak, 0),
-    SpinRate_z = coalesce((p_arsenal$SpinRate[1] - feature_means$SpinRate) / feature_sds$SpinRate, 0),
-    RelHeight_z = coalesce((p_arsenal$RelHeight[1] - feature_means$RelHeight) / feature_sds$RelHeight, 0),
-    RelSide_z = coalesce((p_arsenal$RelSide[1] - feature_means$RelSide) / feature_sds$RelSide, 0)
-  )
-  
-  # Use pre-computed safe z-scores (already done at startup)
-  batter_pitches_safe <- batter_pitches
-  
-  # Vectorized distance calculation
-  distances <- calculate_euclidean_distance_vectorized(batter_pitches_safe, target)
-  
-  # Filter using MAC threshold (0.6)
-  similar_mask <- !is.na(distances) & distances <= distance_threshold
-  similar_pitches <- batter_pitches_safe[similar_mask, ]
-  
-  n_similar <- nrow(similar_pitches)
-  
-  if (n_similar >= 5) {
-    rv100_similar <- 100 * mean(similar_pitches$hitter_rv, na.rm = TRUE)
-    whiff_pct <- 100 * mean(similar_pitches$WhiffIndicator, na.rm = TRUE)
-    chase_pct <- 100 * mean(similar_pitches$chase[similar_pitches$out_of_zone == 1], na.rm = TRUE)
-    woba <- mean(similar_pitches$woba, na.rm = TRUE)
-    
-    # Shrinkage
-    k <- 50
-    shrinkage <- n_similar / (n_similar + k)
-    rv100_shrunk <- shrinkage * rv100_similar + (1 - shrinkage) * 0
-    
-    # Convert to MAC score
-    final_score <- rv100_to_mac_score(rv100_shrunk, n_similar)
-    
-    return(list(
-      score = final_score, 
-      rv100 = round(rv100_shrunk, 2), 
-      n_similar = n_similar,
-      whiff_pct = round(whiff_pct, 1),
-      chase_pct = if(is.nan(chase_pct)) NA else round(chase_pct, 1),
-      woba = round(woba, 3)
-    ))
-  }
-  
-  list(score = 50, rv100 = 0, n_similar = n_similar, whiff_pct = NA, chase_pct = NA, woba = NA)
-}
-
-# Helper function to get score color
-get_matchup_score_color <- function(score) {
-  if (is.na(score)) return("#E0E0E0")
-  if (score >= 70) return("#C8E6C9")  # Pitcher advantage - green
-  if (score >= 60) return("#DCEDC8")
-  if (score >= 55) return("#F0F4C3")
-  if (score >= 45) return("#FFF9C4")  # Neutral - yellow
-  if (score >= 40) return("#FFECB3")
-  if (score >= 30) return("#FFE0B2")
-  return("#FFCDD2")  # Hitter advantage - red
-}
-
-# ============================================================================
-# xRV PREDICTIVE MATCHUP MODEL - XGBoost with Pitch Similarity Features
-# ============================================================================
-# Combines pitcher pitch effectiveness with batter performance against similar pitches
-# Uses Euclidean distance <= 1.0 to find similar pitches for batter features
-
-cat("Building xRV Predictive Model...\n")
-
-# Calculate league-wide prior distributions (fallback only when no data)
-calculate_sec_priors <- function(sec_data) {
-  sec_data %>%
-    filter(!is.na(PitchFamily), !is.na(mean_DRE_bat)) %>%
-    group_by(PitchFamily) %>%
-    summarise(
-      prior_mean = mean(mean_DRE_bat, na.rm = TRUE),
-      prior_sd = sd(mean_DRE_bat, na.rm = TRUE),
-      n_total = n(),
-      .groups = "drop"
-    )
-}
-
-sec_priors <- calculate_sec_priors(sec_pool_data)
-cat("SEC priors calculated for", nrow(sec_priors), "pitch families (fallback only)\n")
-
-# ============================================================================
-# PITCHER-CENTRIC xRV CALCULATION (SIMPLIFIED)
-# ============================================================================
-# Pre-calculate pitcher xRV vs SEC hitters by batter side and pitch family
-# This is much faster than the previous batter-similarity approach
-
-# Calculate pitcher xRV vs SEC hitters by batter hand and pitch family
-pitcher_sec_xrv <- tm_data %>%
-  filter(
-    !is.na(Pitcher),
-    !is.na(PitchFamily),
-    !is.na(mean_DRE_pit),
-    !is.na(BatterSide),
-    BatterTeam %in% sec_teams  # Only vs SEC hitters
-  ) %>%
-  group_by(Pitcher, PitcherThrows, BatterSide, PitchFamily) %>%
-  summarise(
-    n_pitches = n(),
-    xrv_per100 = mean(mean_DRE_pit, na.rm = TRUE) * 100,
-    whiff_pct = mean(is_whiff, na.rm = TRUE) * 100,
-    chase_pct = mean(chase, na.rm = TRUE) * 100,
-    .groups = "drop"
-  ) %>%
-  filter(n_pitches >= 10)
-
-# Also create overall pitcher xRV by batter side (not split by pitch family)
-pitcher_sec_xrv_overall <- tm_data %>%
-  filter(
-    !is.na(Pitcher),
-    !is.na(mean_DRE_pit),
-    !is.na(BatterSide),
-    BatterTeam %in% sec_teams
-  ) %>%
-  group_by(Pitcher, PitcherThrows, BatterSide) %>%
-  summarise(
-    n_pitches = n(),
-    xrv_per100 = mean(mean_DRE_pit, na.rm = TRUE) * 100,
-    whiff_pct = mean(is_whiff, na.rm = TRUE) * 100,
-    chase_pct = mean(chase, na.rm = TRUE) * 100,
-    .groups = "drop"
-  ) %>%
-  filter(n_pitches >= 20)
-
-cat("Built pitcher SEC xRV data:", nrow(pitcher_sec_xrv), "pitch family rows,", 
-    nrow(pitcher_sec_xrv_overall), "overall rows\n")
-
-# ============================================================================
-# PITCHER-CENTRIC MATCHUP FUNCTION (SIMPLIFIED - NO HITTER-SPECIFIC CALCS)
-# ============================================================================
-# Just looks up pre-calculated pitcher xRV vs SEC hitters by batter side
-# User can manually input hitter-specific adjustments in the UI
-
-# Simple function to get pitcher xRV data for matchup matrix
-get_pitcher_sec_stats <- function(pitcher_name, batter_side) {
-  # Get overall stats for this pitcher vs batter side
-  overall_data <- pitcher_sec_xrv_overall %>%
-    filter(Pitcher == pitcher_name, BatterSide == batter_side)
-  
-  # Get pitch family breakdown
-  family_data <- pitcher_sec_xrv %>%
-    filter(Pitcher == pitcher_name, BatterSide == batter_side)
-  
-  if (nrow(overall_data) == 0) {
-    return(list(
-      overall_xrv = NA,
-      fb_xrv = NA,
-      bb_xrv = NA,
-      os_xrv = NA,
-      n_pitches = 0,
-      whiff_pct = NA,
-      chase_pct = NA,
-      pitcher_hand = NA
-    ))
-  }
-  
-  # Get pitch family specific xRV
-  fb_row <- family_data %>% filter(PitchFamily == "FB")
-  bb_row <- family_data %>% filter(PitchFamily == "BB")
-  os_row <- family_data %>% filter(PitchFamily == "OS")
-  
-  list(
-    overall_xrv = overall_data$xrv_per100[1],
-    fb_xrv = if(nrow(fb_row) > 0) fb_row$xrv_per100[1] else NA,
-    bb_xrv = if(nrow(bb_row) > 0) bb_row$xrv_per100[1] else NA,
-    os_xrv = if(nrow(os_row) > 0) os_row$xrv_per100[1] else NA,
-    n_pitches = overall_data$n_pitches[1],
-    whiff_pct = overall_data$whiff_pct[1],
-    chase_pct = overall_data$chase_pct[1],
-    pitcher_hand = overall_data$PitcherThrows[1]
-  )
-}
-
-
-# Helper function for xRV color coding (positive = hitter advantage = red)
-get_xrv_color <- function(xrv) {
-  if (is.na(xrv)) return("#E0E0E0")
-  if (xrv >= 1.5) return("#FFCDD2")    # Strong hitter advantage - red
-  if (xrv >= 0.5) return("#FFE0B2")    # Moderate hitter advantage
-  if (xrv >= 0) return("#FFF9C4")      # Slight hitter advantage - yellow
-  if (xrv >= -0.5) return("#F0F4C3")   # Slight pitcher advantage
-  if (xrv >= -1.5) return("#DCEDC8")   # Moderate pitcher advantage
-  return("#C8E6C9")                     # Strong pitcher advantage - green
-}
-
-# Helper function for xRV text color
-get_xrv_text_color <- function(xrv) {
-  if (is.na(xrv)) return("#666666")
-  if (xrv >= 0.5) return("#C62828")    # Red text for hitter advantage
-  if (xrv >= -0.5) return("#F57F17")   # Orange/yellow for neutral
-  return("#2E7D32")                     # Green text for pitcher advantage
-}
-
-cat("xRV Predictive Model setup complete\n")
 gc(verbose = FALSE)
 
 # ============================================================================
@@ -1041,6 +341,7 @@ detect_batter_handedness <- function(batter_name, tm_data, min_ab_threshold = 15
     return("Right")
   }
 }
+
 
 # ============================================================================
 # ENHANCED GRADE METRICS CALCULATION (PERCENTILE-BASED)
@@ -2079,122 +1380,141 @@ create_heatmap_grid <- function(h_raw, pitcher_hand, split_type = "pitch_type") 
 # ============================================================================
 # ADVANCED HEAT MAP STATS TABLE GENERATOR
 # ============================================================================
-
-# Generate advanced heat map stats table for a batter
 get_advanced_heatmap_stats <- function(batter_name, pitcher_hand, split_type = "pitch_type") {
-  # Stats columns: Pitch Frequency, Swing%, wOBA, Damage (95+), Chase, Whiff, IZ Whiff, IZ Damage
+  # Get batter data filtered by pitcher hand (ON-DEMAND, no cache)
+  batter_data <- tm_data %>%
+    filter(Batter == batter_name, PitcherThrows == pitcher_hand)
+  
+  if (nrow(batter_data) < 10) return(list())
   
   if (split_type == "pitch_type") {
-    # Split by pitch type: 4S, 2S/Si, SL/SW, CB, CH/Spl, Overall
     pitch_types <- c("4S", "2S/Si", "SL/SW", "CB", "CH/Spl")
     
-    # Get data from cache
-    cached_data <- batter_pitch_profile_cache %>%
-      filter(Batter == batter_name, PitcherThrows == pitcher_hand)
+    batter_data <- batter_data %>%
+      mutate(DetailedPitchType = classify_detailed_pitch(TaggedPitchType))
     
-    # Build stats for each pitch type
     stats_list <- lapply(pitch_types, function(pt) {
-      pt_data <- cached_data %>% filter(DetailedPitchType == pt)
-      if (nrow(pt_data) == 0) {
-        return(list(
-          pitch_type = pt,
-          n = 0, pitch_freq = 0, swing_pct = NA, woba = NA,
-          damage_pct = NA, chase_pct = NA, whiff_pct = NA, 
-          iz_whiff_pct = NA, iz_damage_pct = NA
-        ))
+      pt_data <- batter_data %>% filter(DetailedPitchType == pt)
+      
+      if (nrow(pt_data) < 5) {
+        return(list(pitch_type = pt, n = nrow(pt_data), pitch_freq = nrow(pt_data), 
+                    swing_pct = NA, woba = NA, damage_pct = NA, chase_pct = NA, 
+                    whiff_pct = NA, iz_whiff_pct = NA, iz_damage_pct = NA))
       }
-      list(
-        pitch_type = pt,
-        n = pt_data$n_pitches[1],
-        pitch_freq = pt_data$n_pitches[1],
-        swing_pct = pt_data$swing_pct[1],
-        woba = pt_data$woba[1],
-        damage_pct = pt_data$damage_pct[1],
-        chase_pct = pt_data$chase_pct[1],
-        whiff_pct = pt_data$whiff_pct[1],
-        iz_whiff_pct = pt_data$iz_whiff_pct[1],
-        iz_damage_pct = pt_data$iz_damage_pct[1]
-      )
+      
+      n_pitches <- nrow(pt_data)
+      n_swings <- sum(pt_data$is_swing, na.rm = TRUE)
+      n_whiffs <- sum(pt_data$is_whiff, na.rm = TRUE)
+      n_in_zone <- sum(pt_data$in_zone, na.rm = TRUE)
+      n_out_zone <- sum(pt_data$out_of_zone, na.rm = TRUE)
+      n_chase <- sum(pt_data$chase, na.rm = TRUE)
+      n_iz_swing <- sum(pt_data$z_swing, na.rm = TRUE)
+      n_iz_whiff <- sum(pt_data$in_zone_whiff, na.rm = TRUE)
+      n_bip <- sum(pt_data$PitchCall == "InPlay", na.rm = TRUE)
+      n_damage <- sum(pt_data$PitchCall == "InPlay" & pt_data$ExitSpeed >= 95, na.rm = TRUE)
+      
+      list(pitch_type = pt, n = n_pitches, pitch_freq = n_pitches,
+           swing_pct = if(n_pitches > 0) 100 * n_swings / n_pitches else NA,
+           woba = mean(pt_data$woba, na.rm = TRUE),
+           damage_pct = if(n_bip > 0) 100 * n_damage / n_bip else NA,
+           chase_pct = if(n_out_zone > 0) 100 * n_chase / n_out_zone else NA,
+           whiff_pct = if(n_swings > 0) 100 * n_whiffs / n_swings else NA,
+           iz_whiff_pct = if(n_iz_swing > 0) 100 * n_iz_whiff / n_iz_swing else NA,
+           iz_damage_pct = if(n_in_zone > 0) 100 * n_damage / pmax(1, n_bip) else NA)
     })
     
     # Add overall row
-    overall_data <- batter_overall_cache %>%
-      filter(Batter == batter_name, PitcherThrows == pitcher_hand)
+    n_pitches <- nrow(batter_data)
+    n_swings <- sum(batter_data$is_swing, na.rm = TRUE)
+    n_whiffs <- sum(batter_data$is_whiff, na.rm = TRUE)
+    n_in_zone <- sum(batter_data$in_zone, na.rm = TRUE)
+    n_out_zone <- sum(batter_data$out_of_zone, na.rm = TRUE)
+    n_chase <- sum(batter_data$chase, na.rm = TRUE)
+    n_iz_swing <- sum(batter_data$z_swing, na.rm = TRUE)
+    n_iz_whiff <- sum(batter_data$in_zone_whiff, na.rm = TRUE)
+    n_bip <- sum(batter_data$PitchCall == "InPlay", na.rm = TRUE)
+    n_damage <- sum(batter_data$PitchCall == "InPlay" & batter_data$ExitSpeed >= 95, na.rm = TRUE)
     
-    if (nrow(overall_data) > 0) {
-      stats_list[[length(stats_list) + 1]] <- list(
-        pitch_type = "Overall",
-        n = overall_data$n_pitches[1],
-        pitch_freq = overall_data$n_pitches[1],
-        swing_pct = overall_data$swing_pct[1],
-        woba = overall_data$woba[1],
-        damage_pct = overall_data$damage_pct[1],
-        chase_pct = overall_data$chase_pct[1],
-        whiff_pct = overall_data$whiff_pct[1],
-        iz_whiff_pct = overall_data$iz_whiff_pct[1],
-        iz_damage_pct = overall_data$iz_damage_pct[1]
-      )
-    }
+    stats_list[[length(stats_list) + 1]] <- list(pitch_type = "Overall", n = n_pitches, pitch_freq = n_pitches,
+         swing_pct = if(n_pitches > 0) 100 * n_swings / n_pitches else NA,
+         woba = mean(batter_data$woba, na.rm = TRUE),
+         damage_pct = if(n_bip > 0) 100 * n_damage / n_bip else NA,
+         chase_pct = if(n_out_zone > 0) 100 * n_chase / n_out_zone else NA,
+         whiff_pct = if(n_swings > 0) 100 * n_whiffs / n_swings else NA,
+         iz_whiff_pct = if(n_iz_swing > 0) 100 * n_iz_whiff / n_iz_swing else NA,
+         iz_damage_pct = if(n_bip > 0) 100 * n_damage / n_bip else NA)
     
     return(stats_list)
     
   } else if (split_type == "count_type") {
-    # Split by count type: 1P, 2K, Ahead, Behind, Last 15
     count_types <- c("1P", "2K", "Ahead", "Behind")
     
-    # Get data from cache
-    cached_data <- batter_count_profile_cache %>%
-      filter(Batter == batter_name, PitcherThrows == pitcher_hand)
+    batter_data <- batter_data %>%
+      mutate(CountType = case_when(
+        Balls == 0 & Strikes == 0 ~ "1P",
+        Strikes == 2 ~ "2K",
+        Strikes > Balls ~ "Ahead",
+        Balls > Strikes ~ "Behind",
+        TRUE ~ "Even"
+      ))
     
-    # Build stats for each count type
     stats_list <- lapply(count_types, function(ct) {
-      ct_data <- cached_data %>% filter(CountType == ct)
-      if (nrow(ct_data) == 0) {
-        return(list(
-          count_type = ct,
-          n = 0, pitch_freq = 0, swing_pct = NA, woba = NA,
-          damage_pct = NA, chase_pct = NA, whiff_pct = NA,
-          iz_whiff_pct = NA, iz_damage_pct = NA
-        ))
+      ct_data <- batter_data %>% filter(CountType == ct)
+      if (nrow(ct_data) < 5) {
+        return(list(count_type = ct, n = nrow(ct_data), pitch_freq = nrow(ct_data),
+                    swing_pct = NA, woba = NA, damage_pct = NA, chase_pct = NA,
+                    whiff_pct = NA, iz_whiff_pct = NA, iz_damage_pct = NA))
       }
-      list(
-        count_type = ct,
-        n = ct_data$n_pitches[1],
-        pitch_freq = ct_data$n_pitches[1],
-        swing_pct = ct_data$swing_pct[1],
-        woba = ct_data$woba[1],
-        damage_pct = ct_data$damage_pct[1],
-        chase_pct = ct_data$chase_pct[1],
-        whiff_pct = ct_data$whiff_pct[1],
-        iz_whiff_pct = ct_data$iz_whiff_pct[1],
-        iz_damage_pct = ct_data$iz_damage_pct[1]
-      )
+      
+      n_pitches <- nrow(ct_data)
+      n_swings <- sum(ct_data$is_swing, na.rm = TRUE)
+      n_whiffs <- sum(ct_data$is_whiff, na.rm = TRUE)
+      n_in_zone <- sum(ct_data$in_zone, na.rm = TRUE)
+      n_out_zone <- sum(ct_data$out_of_zone, na.rm = TRUE)
+      n_chase <- sum(ct_data$chase, na.rm = TRUE)
+      n_iz_swing <- sum(ct_data$z_swing, na.rm = TRUE)
+      n_iz_whiff <- sum(ct_data$in_zone_whiff, na.rm = TRUE)
+      n_bip <- sum(ct_data$PitchCall == "InPlay", na.rm = TRUE)
+      n_damage <- sum(ct_data$PitchCall == "InPlay" & ct_data$ExitSpeed >= 95, na.rm = TRUE)
+      
+      list(count_type = ct, n = n_pitches, pitch_freq = n_pitches,
+           swing_pct = if(n_pitches > 0) 100 * n_swings / n_pitches else NA,
+           woba = mean(ct_data$woba, na.rm = TRUE),
+           damage_pct = if(n_bip > 0) 100 * n_damage / n_bip else NA,
+           chase_pct = if(n_out_zone > 0) 100 * n_chase / n_out_zone else NA,
+           whiff_pct = if(n_swings > 0) 100 * n_whiffs / n_swings else NA,
+           iz_whiff_pct = if(n_iz_swing > 0) 100 * n_iz_whiff / n_iz_swing else NA,
+           iz_damage_pct = if(n_in_zone > 0) 100 * n_damage / pmax(1, n_bip) else NA)
     })
     
-    # Add Last 15 row from cache
-    last15_data <- batter_last15_cache %>%
-      filter(Batter == batter_name, PitcherThrows == pitcher_hand)
+    # Add Last 15 row
+    last15_dates <- get_last_n_games(tm_data, batter_name, 15)
+    last15_data <- batter_data %>% filter(Date %in% last15_dates)
     
-    if (nrow(last15_data) > 0) {
-      stats_list[[length(stats_list) + 1]] <- list(
-        count_type = "Last 15",
-        n = last15_data$n_pitches[1],
-        pitch_freq = last15_data$n_pitches[1],
-        swing_pct = last15_data$swing_pct[1],
-        woba = last15_data$woba[1],
-        damage_pct = last15_data$damage_pct[1],
-        chase_pct = last15_data$chase_pct[1],
-        whiff_pct = last15_data$whiff_pct[1],
-        iz_whiff_pct = last15_data$iz_whiff_pct[1],
-        iz_damage_pct = last15_data$iz_damage_pct[1]
-      )
+    if (nrow(last15_data) >= 5) {
+      n_pitches <- nrow(last15_data)
+      n_swings <- sum(last15_data$is_swing, na.rm = TRUE)
+      n_whiffs <- sum(last15_data$is_whiff, na.rm = TRUE)
+      n_in_zone <- sum(last15_data$in_zone, na.rm = TRUE)
+      n_out_zone <- sum(last15_data$out_of_zone, na.rm = TRUE)
+      n_chase <- sum(last15_data$chase, na.rm = TRUE)
+      n_iz_swing <- sum(last15_data$z_swing, na.rm = TRUE)
+      n_iz_whiff <- sum(last15_data$in_zone_whiff, na.rm = TRUE)
+      n_bip <- sum(last15_data$PitchCall == "InPlay", na.rm = TRUE)
+      n_damage <- sum(last15_data$PitchCall == "InPlay" & last15_data$ExitSpeed >= 95, na.rm = TRUE)
+      
+      stats_list[[length(stats_list) + 1]] <- list(count_type = "Last 15", n = n_pitches, pitch_freq = n_pitches,
+           swing_pct = if(n_pitches > 0) 100 * n_swings / n_pitches else NA,
+           woba = mean(last15_data$woba, na.rm = TRUE),
+           damage_pct = if(n_bip > 0) 100 * n_damage / n_bip else NA,
+           chase_pct = if(n_out_zone > 0) 100 * n_chase / n_out_zone else NA,
+           whiff_pct = if(n_swings > 0) 100 * n_whiffs / n_swings else NA,
+           iz_whiff_pct = if(n_iz_swing > 0) 100 * n_iz_whiff / n_iz_swing else NA,
+           iz_damage_pct = if(n_bip > 0) 100 * n_damage / n_bip else NA)
     } else {
-      stats_list[[length(stats_list) + 1]] <- list(
-        count_type = "Last 15",
-        n = 0, pitch_freq = 0, swing_pct = NA, woba = NA,
-        damage_pct = NA, chase_pct = NA, whiff_pct = NA,
-        iz_whiff_pct = NA, iz_damage_pct = NA
-      )
+      stats_list[[length(stats_list) + 1]] <- list(count_type = "Last 15", n = 0, pitch_freq = 0,
+           swing_pct = NA, woba = NA, damage_pct = NA, chase_pct = NA,
+           whiff_pct = NA, iz_whiff_pct = NA, iz_damage_pct = NA)
     }
     
     return(stats_list)
@@ -2202,7 +1522,7 @@ get_advanced_heatmap_stats <- function(batter_name, pitcher_hand, split_type = "
   
   return(list())
 }
-
+                                                   
 # ============================================================================
 # TREND CHARTS - Rolling stat averages by game date
 # ============================================================================
@@ -2528,12 +1848,7 @@ login_ui <- fluidPage(
 app_ui <- fluidPage(
   tags$head(tags$style(app_css)),
   div(class = "app-header",
-      div(div(class = "header-title", "Hitter Scouting Cards"), div(class = "header-subtitle", "Enhanced Analytics Dashboard - SEC Pool Comparison"))),
-  
-  tabsetPanel(id = "main_tabs", type = "tabs",
-    # ===== SCOUTING CARDS TAB =====
-    tabPanel("Scouting Cards",
-      div(class = "stats-header", h3("Enhanced Hitter Scouting Cards"), p("Comprehensive stats, heatmaps, and charts with SEC percentile rankings")),
+      div(div(class = "header-title", "Opposing Hitter Scouting Cards"), div(class = "header-subtitle", "Coastal Carolina Baseball Analytics"))),
       
       fluidRow(
         column(3,
@@ -2547,10 +1862,7 @@ app_ui <- fluidPage(
                    textInput("pdf_custom_title", "Custom PDF Title:", placeholder = "Optional: Enter a custom title"),
                    downloadButton("download_scout_pdf", "Download Scouting Report (PDF)", class = "btn-bronze", style = "width: 100%;"))),
         column(9, uiOutput("hitter_detail_panel")))
-    ),
-    
-  )
-)
+    )
 
 
 
@@ -3768,6 +3080,7 @@ output$download_scout_pdf <- downloadHandler(
       dev.off()
     }
   )
+}
 }
 
 shinyApp(ui = ui, server = server)
