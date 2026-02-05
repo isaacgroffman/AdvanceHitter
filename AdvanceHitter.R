@@ -8,6 +8,8 @@ library(grid)
 library(scales)
 library(arrow)
 library(httr)
+library(gt)
+library(base64enc)
 
 # Suppress jsonlite warnings about named vectors (cosmetic, doesn't affect functionality)
 options(shiny.sanitize.errors = FALSE)
@@ -141,8 +143,10 @@ required_cols <- c(
   "ExitSpeed", "Angle", "Distance", "Bearing",
   # Count info
   "Balls", "Strikes", "Date",
+  # Pitch movement data (for matchup matrices)
+  "RelSpeed", "InducedVertBreak", "HorzBreak",
   # Pre-calculated metrics (from TM2025)
-  "mean_DRE_bat", "woba", "wobacon", "slg",
+  "mean_DRE_bat", "mean_DRE_pit", "woba", "wobacon", "slg",
   "is_put_away", "is_walk", "is_ab", "is_hit",
   "in_zone", "in_zone_whiff", "is_whiff", "is_swing", "chase", "is_pa", "is_k"
 )
@@ -237,8 +241,20 @@ add_indicators <- function(df) {
   if (!"is_walk" %in% names(df)) {
     df <- df %>% mutate(is_walk = 0)
   }
+  if (!"RelSpeed" %in% names(df)) {
+    df <- df %>% mutate(RelSpeed = NA_real_)
+  }
+  if (!"InducedVertBreak" %in% names(df)) {
+    df <- df %>% mutate(InducedVertBreak = NA_real_)
+  }
+  if (!"HorzBreak" %in% names(df)) {
+    df <- df %>% mutate(HorzBreak = NA_real_)
+  }
   if (!"mean_DRE_bat" %in% names(df)) {
     df <- df %>% mutate(mean_DRE_bat = 0)
+  }
+  if (!"mean_DRE_pit" %in% names(df)) {
+    df <- df %>% mutate(mean_DRE_pit = NA_real_)
   }
   if (!"woba" %in% names(df)) {
     df <- df %>% mutate(woba = NA_real_)
@@ -270,6 +286,7 @@ add_indicators <- function(df) {
 tm_data <- add_indicators(tm_data)
 
 all_hitters <- sort(unique(tm_data$Batter))
+all_pitchers <- sort(unique(tm_data$Pitcher))
 
 # Create SEC pool for percentile comparisons (optimized - select only needed columns)
 sec_pool_cols <- c("Batter", "PitcherThrows", "BatterTeam", "TaggedPitchType", "PitchCall", "PlayResult",
@@ -289,6 +306,139 @@ d1_pool_data <- tm_data
 
 # Clean up memory
 gc(verbose = FALSE)
+
+# ============================================================================
+# MATCHUP MATRIX CONFIGURATIONS
+# ============================================================================
+
+MM_SPLIT_CONFIG <- list(
+  ride_fb_rhp = list(name = "Ride FB (RHP)", pitch_types = c("Fastball", "Four-Seam"), ivb_min = 17, pitcher_hand = "Right", fallback = "fb_rhp", threshold = 80),
+  ride_fb_lhp = list(name = "Ride FB (LHP)", pitch_types = c("Fastball", "Four-Seam"), ivb_min = 17, pitcher_hand = "Left", fallback = "fb_lhp", threshold = 80),
+  sink_fb_rhp = list(name = "Sink FB (RHP)", pitch_types = c("Fastball", "Four-Seam", "Sinker"), ivb_max = 12, hb_min = 10, use_abs_hb = TRUE, pitcher_hand = "Right", fallback = "fb_rhp", threshold = 60),
+  sink_fb_lhp = list(name = "Sink FB (LHP)", pitch_types = c("Fastball", "Four-Seam", "Sinker"), ivb_max = 12, hb_min = 10, use_abs_hb = TRUE, pitcher_hand = "Left", fallback = "fb_lhp", threshold = 60),
+  hard_velo_rhp = list(name = "Hard Velo (RHP)", pitch_types = c("Fastball", "Four-Seam", "Sinker"), velo_min = 92, pitcher_hand = "Right", fallback = "fb_rhp", threshold = 80),
+  hard_velo_lhp = list(name = "Hard Velo (LHP)", pitch_types = c("Fastball", "Four-Seam", "Sinker"), velo_min = 92, pitcher_hand = "Left", fallback = "fb_lhp", threshold = 80),
+  sweep_rhp = list(name = "Sweep (RHP)", pitch_types = c("Slider", "Sweeper", "Curveball"), hb_min = 14, use_abs_hb = TRUE, pitcher_hand = "Right", fallback = "bb_rhp", threshold = 60),
+  sweep_lhp = list(name = "Sweep (LHP)", pitch_types = c("Slider", "Sweeper", "Curveball"), hb_min = 14, use_abs_hb = TRUE, pitcher_hand = "Left", fallback = "bb_lhp", threshold = 60),
+  downer_rhp = list(name = "Downer (RHP)", pitch_types = c("Slider", "Curveball", "Sweeper"), ivb_max = -6, pitcher_hand = "Right", fallback = "bb_rhp", threshold = 60),
+  downer_lhp = list(name = "Downer (LHP)", pitch_types = c("Slider", "Curveball", "Sweeper"), ivb_max = -6, pitcher_hand = "Left", fallback = "bb_lhp", threshold = 60),
+  gyro_cut_rhp = list(name = "Gyro/Cut (RHP)", pitch_types = c("Cutter", "Slider"), ivb_min = -3, ivb_max = 6, hb_max = 8, use_abs_hb = TRUE, pitcher_hand = "Right", fallback = "bb_rhp", threshold = 50),
+  gyro_cut_lhp = list(name = "Gyro/Cut (LHP)", pitch_types = c("Cutter", "Slider"), ivb_min = -3, ivb_max = 6, hb_max = 8, use_abs_hb = TRUE, pitcher_hand = "Left", fallback = "bb_lhp", threshold = 50),
+  chspl_rhp = list(name = "CH/SPL (RHP)", pitch_types = c("ChangeUp", "Changeup", "Splitter"), pitcher_hand = "Right", fallback = "os_rhp", threshold = 60),
+  chspl_lhp = list(name = "CH/SPL (LHP)", pitch_types = c("ChangeUp", "Changeup", "Splitter"), pitcher_hand = "Left", fallback = "os_lhp", threshold = 60)
+)
+
+MM_FAMILY_CONFIG <- list(
+  fb_rhp = list(name = "All FB (RHP)", pitch_types = c("Fastball", "Four-Seam", "Sinker", "Cutter"), pitcher_hand = "Right", fallback = "vs_rhp", threshold = 100),
+  fb_lhp = list(name = "All FB (LHP)", pitch_types = c("Fastball", "Four-Seam", "Sinker", "Cutter"), pitcher_hand = "Left", fallback = "vs_lhp", threshold = 100),
+  bb_rhp = list(name = "All BB (RHP)", pitch_types = c("Slider", "Curveball", "Sweeper", "Cutter"), pitcher_hand = "Right", fallback = "vs_rhp", threshold = 80),
+  bb_lhp = list(name = "All BB (LHP)", pitch_types = c("Slider", "Curveball", "Sweeper", "Cutter"), pitcher_hand = "Left", fallback = "vs_lhp", threshold = 80),
+  os_rhp = list(name = "All OS (RHP)", pitch_types = c("ChangeUp", "Changeup", "Splitter"), pitcher_hand = "Right", fallback = "vs_rhp", threshold = 60),
+  os_lhp = list(name = "All OS (LHP)", pitch_types = c("ChangeUp", "Changeup", "Splitter"), pitcher_hand = "Left", fallback = "vs_lhp", threshold = 60)
+)
+
+MM_PLATOON_CONFIG <- list(
+  vs_rhp = list(name = "vs RHP", pitch_types = NULL, pitcher_hand = "Right", fallback = "overall", threshold = 150),
+  vs_lhp = list(name = "vs LHP", pitch_types = NULL, pitcher_hand = "Left", fallback = "overall", threshold = 150)
+)
+
+MM_OVERALL_CONFIG <- list(
+  overall = list(name = "Overall", pitch_types = NULL, pitcher_hand = NULL, fallback = NULL, threshold = 200)
+)
+
+MM_ALL_SPLITS <- c(MM_SPLIT_CONFIG, MM_FAMILY_CONFIG, MM_PLATOON_CONFIG, MM_OVERALL_CONFIG)
+
+MM_DISPLAY_GROUPS <- list(
+  "Movement (RHP)" = c("ride_fb_rhp", "sink_fb_rhp", "hard_velo_rhp", "sweep_rhp", "downer_rhp", "gyro_cut_rhp", "chspl_rhp"),
+  "Movement (LHP)" = c("ride_fb_lhp", "sink_fb_lhp", "hard_velo_lhp", "sweep_lhp", "downer_lhp", "gyro_cut_lhp", "chspl_lhp"),
+  "Pitch Family (RHP)" = c("fb_rhp", "bb_rhp", "os_rhp"),
+  "Pitch Family (LHP)" = c("fb_lhp", "bb_lhp", "os_lhp"),
+  "Platoon" = c("vs_rhp", "vs_lhp"),
+  "Overall" = c("overall")
+)
+
+# ============================================================================
+# MATCHUP MATRIX CORE FUNCTIONS
+# ============================================================================
+
+mm_fast_filter <- function(df, config, is_pitcher = FALSE) {
+  if (nrow(df) == 0) return(df)
+  mask <- rep(TRUE, nrow(df))
+  if (!is.null(config$pitch_types)) mask <- mask & df$TaggedPitchType %in% config$pitch_types
+  if (!is.null(config$pitcher_hand)) {
+    if (is_pitcher) {
+      batter_side <- ifelse(config$pitcher_hand == "Right", "Right", "Left")
+      if ("BatterSide" %in% names(df)) {
+        mask <- mask & df$BatterSide == batter_side
+      }
+    } else {
+      mask <- mask & df$PitcherThrows == config$pitcher_hand
+    }
+  }
+  if (!is.null(config$ivb_min)) mask <- mask & !is.na(df$InducedVertBreak) & df$InducedVertBreak >= config$ivb_min
+  if (!is.null(config$ivb_max)) mask <- mask & !is.na(df$InducedVertBreak) & df$InducedVertBreak <= config$ivb_max
+  hb <- if (!is.null(config$use_abs_hb) && config$use_abs_hb) abs(df$HorzBreak) else df$HorzBreak
+  if (!is.null(config$hb_min)) mask <- mask & !is.na(hb) & hb >= config$hb_min
+  if (!is.null(config$hb_max)) mask <- mask & !is.na(hb) & hb <= config$hb_max
+  if (!is.null(config$velo_min)) mask <- mask & !is.na(df$RelSpeed) & df$RelSpeed >= config$velo_min
+  df[mask, , drop = FALSE]
+}
+
+mm_calc_rv_stats <- function(df, rv_col) {
+  rv <- df[[rv_col]][!is.na(df[[rv_col]])]
+  n <- length(rv)
+  if (n == 0) return(list(rv100 = NA_real_, n = 0L))
+  list(rv100 = 100 * mean(rv), n = n)
+}
+
+mm_calc_hierarchical_rv <- function(player_data, rv_col, split_name, is_pitcher = FALSE) {
+  config <- MM_ALL_SPLITS[[split_name]]
+  if (is.null(config)) return(list(rv100 = 0, n = 0, weight = 0, raw_rv100 = NA_real_))
+  filtered <- mm_fast_filter(player_data, config, is_pitcher)
+  stats <- mm_calc_rv_stats(filtered, rv_col)
+  weight <- min(stats$n / config$threshold, 1)
+  if (weight >= 1 || is.null(config$fallback)) {
+    return(list(rv100 = ifelse(is.na(stats$rv100), 0, stats$rv100), n = stats$n, weight = weight, raw_rv100 = stats$rv100))
+  }
+  fallback <- mm_calc_hierarchical_rv(player_data, rv_col, config$fallback, is_pitcher)
+  this_rv <- ifelse(is.na(stats$rv100), 0, stats$rv100)
+  blended <- weight * this_rv + (1 - weight) * fallback$rv100
+  list(rv100 = blended, n = stats$n, weight = weight, raw_rv100 = stats$rv100)
+}
+
+mm_calc_all_splits <- function(player_data, rv_col, is_pitcher = FALSE) {
+  results <- lapply(names(MM_ALL_SPLITS), function(s) {
+    res <- mm_calc_hierarchical_rv(player_data, rv_col, s, is_pitcher)
+    res$name <- MM_ALL_SPLITS[[s]]$name
+    res
+  })
+  names(results) <- names(MM_ALL_SPLITS)
+  results
+}
+
+mm_calc_matchup <- function(h_rv, p_rv, h_w, p_w) {
+  combined_conf <- h_w * p_w
+  raw <- h_rv - p_rv
+  weighted <- combined_conf * raw + (1 - combined_conf) * 0
+  list(raw = raw, weighted = weighted, confidence = combined_conf)
+}
+
+mm_calc_overall_matchup <- function(h_splits, p_splits, p_data) {
+  total <- nrow(p_data)
+  if (total == 0) return(list(rv = NA_real_, confidence = 0))
+  wsum <- 0; csum <- 0; tweight <- 0
+  for (s in names(MM_SPLIT_CONFIG)) {
+    n_split <- nrow(mm_fast_filter(p_data, MM_SPLIT_CONFIG[[s]], is_pitcher = TRUE))
+    usage <- n_split / total
+    if (usage > 0) {
+      m <- mm_calc_matchup(h_splits[[s]]$rv100, p_splits[[s]]$rv100, h_splits[[s]]$weight, p_splits[[s]]$weight)
+      wsum <- wsum + m$weighted * usage
+      csum <- csum + m$confidence * usage
+      tweight <- tweight + usage
+    }
+  }
+  if (tweight > 0) list(rv = wsum / tweight, confidence = csum / tweight) else list(rv = NA_real_, confidence = 0)
+}
 
 # ============================================================================
 # RUN VALUE CALCULATION FUNCTION
@@ -1785,6 +1935,58 @@ app_css <- HTML("
   /* Toggle switch for advanced heatmaps */
   .shiny-input-container.checkbox { margin-bottom: 10px; }
   .shiny-input-container.checkbox label { font-weight: 600; color: #006F71; }
+
+  /* Matchup Matrices Tab Styles */
+  .mm-controls-card {
+    background: white; border-radius: 12px; padding: 20px; margin-bottom: 15px;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.05); border: 1px solid rgba(0,111,113,.2);
+  }
+  .mm-controls-card label { font-weight: 700; color: #006F71; font-size: 0.85rem; }
+  .mm-status-bar {
+    background: #e8f5f4; border-radius: 8px; padding: 10px 16px;
+    font-size: 0.85rem; color: #006F71; margin-bottom: 15px;
+  }
+  .mm-results-card {
+    background: white; border-radius: 12px; padding: 20px; margin-bottom: 15px;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.05); border: 1px solid rgba(0,111,113,.2);
+  }
+  .mm-results-card h3 {
+    color: #006F71; font-weight: 800; font-size: 1.1rem;
+    border-bottom: 2px solid #006F71; padding-bottom: 8px; margin: 0 0 16px;
+  }
+  .mm-empty-state {
+    text-align: center; padding: 60px 20px; color: #666;
+  }
+  .mm-empty-state .icon { font-size: 3rem; color: #006F71; margin-bottom: 16px; }
+  .btn-mm-analyze {
+    background: linear-gradient(135deg, #006F71, #004d4e); color: #fff;
+    border: none; border-radius: 8px; padding: 12px 28px; font-weight: 700;
+    font-size: 0.95rem; cursor: pointer; transition: all 0.2s;
+  }
+  .btn-mm-analyze:hover { transform: translateY(-2px); box-shadow: 0 6px 16px rgba(0,111,113,0.3); }
+  .btn-mm-download {
+    background: linear-gradient(135deg, #CD853F, #8b6914);
+    color: #fff; border: none; border-radius: 6px;
+    padding: 8px 16px; font-weight: 600; font-size: 0.85rem;
+    cursor: pointer; transition: all 0.2s;
+  }
+  .btn-mm-download:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 4px 12px rgba(205, 133, 63, 0.3);
+  }
+  .mm-download-row { display: flex; gap: 10px; flex-wrap: wrap; }
+  .mm-main-tabs > .nav-pills > li > a {
+    color: #006F71; font-weight: 700; font-size: 15px;
+    border: 2px solid transparent; border-radius: 25px;
+    padding: 8px 20px; transition: all 0.2s;
+  }
+  .mm-main-tabs > .nav-pills > li > a:hover {
+    background: #e8f5f4; border-color: #006F71;
+  }
+  .mm-main-tabs > .nav-pills > li.active > a {
+    background: #006F71 !important; color: white !important;
+    border-color: #006F71;
+  }
 ")
 
 # ============================================================================
@@ -1848,21 +2050,136 @@ login_ui <- fluidPage(
 app_ui <- fluidPage(
   tags$head(tags$style(app_css)),
   div(class = "app-header",
-      div(div(class = "header-title", "Opposing Hitter Scouting Cards"), div(class = "header-subtitle", "Coastal Carolina Baseball Analytics"))),
+      div(div(class = "header-title", "Coastal Carolina Baseball Analytics"), div(class = "header-subtitle", "Opposing Hitter Scouting & Matchup Analysis"))),
+  
+  div(class = "mm-main-tabs",
+    tabsetPanel(id = "main_tabs", type = "pills",
       
-      fluidRow(
-        column(3,
-               div(class = "chart-box",
-                   div(class = "chart-box-title", "Select Hitters"),
-                   selectizeInput("scout_hitters", "Add Hitters:", choices = NULL, multiple = TRUE, 
-                                  options = list(placeholder = "Search hitters...", maxItems = 30)),
-                   hr(),
-                   div(class = "scroll-container", style = "max-height: 500px;", uiOutput("hitter_list_ui")),
-                   hr(),
-                   textInput("pdf_custom_title", "Custom PDF Title:", placeholder = "Optional: Enter a custom title"),
-                   downloadButton("download_scout_pdf", "Download Scouting Report (PDF)", class = "btn-bronze", style = "width: 100%;"))),
-        column(9, uiOutput("hitter_detail_panel")))
+      # ====== TAB 1: SCOUTING CARDS (existing functionality) ======
+      tabPanel("Scouting Cards",
+        div(style = "padding-top: 15px;",
+          fluidRow(
+            column(3,
+                   div(class = "chart-box",
+                       div(class = "chart-box-title", "Select Hitters"),
+                       selectizeInput("scout_hitters", "Add Hitters:", choices = NULL, multiple = TRUE, 
+                                      options = list(placeholder = "Search hitters...", maxItems = 30)),
+                       hr(),
+                       div(class = "scroll-container", style = "max-height: 500px;", uiOutput("hitter_list_ui")),
+                       hr(),
+                       textInput("pdf_custom_title", "Custom PDF Title:", placeholder = "Optional: Enter a custom title"),
+                       downloadButton("download_scout_pdf", "Download Scouting Report (PDF)", class = "btn-bronze", style = "width: 100%;"))),
+            column(9, uiOutput("hitter_detail_panel")))
+        )
+      ),
+      
+      # ====== TAB 2: MATCHUP MATRICES ======
+      tabPanel("Matchup Matrices",
+        div(style = "padding: 15px; max-width: 1400px; margin: 0 auto;",
+          
+          # Controls Card
+          div(class = "mm-controls-card",
+            fluidRow(
+              column(4,
+                tags$label("Hitters"),
+                selectizeInput("mm_hitters", NULL, choices = NULL, multiple = TRUE,
+                  options = list(placeholder = "Select hitters...", maxItems = 12))
+              ),
+              column(4,
+                tags$label("Pitchers"),
+                selectizeInput("mm_pitchers", NULL, choices = NULL, multiple = TRUE,
+                  options = list(placeholder = "Select pitchers...", maxItems = 8))
+              ),
+              column(2,
+                tags$label("View"),
+                selectInput("mm_view_mode", NULL, choices = c(
+                  "Matrix (Overall)" = "matrix_overall",
+                  "Matrix (by Split)" = "matrix_split",
+                  "Hitter Profiles" = "hitter_profiles",
+                  "Pitcher Profiles" = "pitcher_profiles"
+                ))
+              ),
+              column(2,
+                div(style = "margin-top: 22px;",
+                  actionButton("mm_analyze", "Analyze", class = "btn-mm-analyze"))
+              )
+            ),
+            
+            # Split selection (conditional on matrix_split view)
+            conditionalPanel("input.mm_view_mode == 'matrix_split'",
+              div(style = "margin-top: 16px;",
+                tags$label(style = "font-weight: 700; color: #006F71; font-size: 0.85rem;", "Select Split"),
+                selectInput("mm_selected_split", NULL,
+                  choices = c(setNames(names(MM_ALL_SPLITS), sapply(MM_ALL_SPLITS, `[[`, "name"))),
+                  width = "300px")
+              )
+            ),
+            
+            # Split group checkboxes for profiles
+            conditionalPanel("input.mm_view_mode == 'hitter_profiles' || input.mm_view_mode == 'pitcher_profiles'",
+              div(style = "margin-top: 16px;",
+                tags$label(style = "font-weight: 700; color: #006F71; font-size: 0.85rem;", "Display Splits"),
+                checkboxGroupInput("mm_split_groups", NULL, inline = TRUE,
+                  choices = names(MM_DISPLAY_GROUPS),
+                  selected = c("Movement (RHP)", "Movement (LHP)"))
+              )
+            ),
+            
+            # PDF Report Options
+            div(style = "margin-top: 20px; padding-top: 16px; border-top: 1px solid #e0e0e0;",
+              tags$label(style = "font-weight: 700; color: #CD853F; font-size: 0.9rem;", "PDF Report Options"),
+              div(style = "margin-top: 12px;",
+                textInput("mm_pdf_title", "Report Title", value = "Matchup Matrix Report", width = "100%")
+              ),
+              div(style = "margin-top: 8px;",
+                textAreaInput("mm_pdf_best_matchups", "Best Matchups",
+                  placeholder = "e.g., Smith vs Johnson - favorable on breaking balls",
+                  rows = 2, width = "100%")
+              ),
+              div(style = "margin-top: 8px;",
+                textAreaInput("mm_pdf_worst_matchups", "Worst Matchups",
+                  placeholder = "e.g., Davis vs Miller - struggles with high velo",
+                  rows = 2, width = "100%")
+              ),
+              div(style = "margin-top: 8px;",
+                textAreaInput("mm_pdf_notes", "Additional Notes",
+                  placeholder = "Game notes, scouting observations, etc.",
+                  rows = 3, width = "100%")
+              )
+            )
+          ),
+          
+          # Status Bar
+          div(class = "mm-status-bar", textOutput("mm_status")),
+          
+          # Results (shown after analyze)
+          conditionalPanel("input.mm_analyze > 0",
+            div(class = "mm-results-card",
+              div(style = "display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;",
+                h3(textOutput("mm_results_title"), style = "margin: 0;"),
+                div(class = "mm-download-row",
+                  downloadButton("mm_download_png", "Download PNG", class = "btn-mm-download"),
+                  downloadButton("mm_download_pdf", "Download All (PDF)", class = "btn-mm-download")
+                )
+              ),
+              div(style = "margin-top: 16px;",
+                gt_output("mm_results_table")
+              )
+            )
+          ),
+          
+          # Empty state
+          conditionalPanel("input.mm_analyze == 0",
+            div(class = "mm-empty-state",
+              div(class = "icon", icon("baseball")),
+              p("Select hitters and pitchers, then click Analyze")
+            )
+          )
+        )
+      )
     )
+  )
+)
 
 
 
@@ -1899,7 +2216,9 @@ server <- function(input, output, session) {
   # Initialize all selectize inputs AFTER login
   observeEvent(logged_in(), {
     if (logged_in()) {
-      updateSelectizeInput(session, "scout_hitters", choices = all_hitters, server = TRUE) 
+      updateSelectizeInput(session, "scout_hitters", choices = all_hitters, server = TRUE)
+      updateSelectizeInput(session, "mm_hitters", choices = all_hitters, server = TRUE)
+      updateSelectizeInput(session, "mm_pitchers", choices = all_pitchers, server = TRUE)
     }
   }, ignoreInit = TRUE)
   
@@ -2523,6 +2842,477 @@ server <- function(input, output, session) {
     }, ignoreInit = TRUE)
   })
   
+  # ============================================================================
+  # MATCHUP MATRICES TAB - SERVER LOGIC
+  # ============================================================================
+  
+  # Status text
+  output$mm_status <- renderText({
+    n_h <- length(input$mm_hitters)
+    n_p <- length(input$mm_pitchers)
+    paste0(format(nrow(tm_data), big.mark = ","), " pitches | ", 
+           n_h, " hitter", ifelse(n_h != 1, "s", ""), " selected | ",
+           n_p, " pitcher", ifelse(n_p != 1, "s", ""), " selected")
+  })
+  
+  # Results title
+  output$mm_results_title <- renderText({
+    switch(input$mm_view_mode,
+      "matrix_overall" = "Matchup Matrix (Overall Weighted RV/100)",
+      "matrix_split" = paste("Matchup Matrix:", MM_ALL_SPLITS[[input$mm_selected_split]]$name),
+      "hitter_profiles" = "Hitter Profiles (RV/100 by Split)",
+      "pitcher_profiles" = "Pitcher Profiles (RV/100 by Split)"
+    )
+  })
+  
+  # Calculate all data on analyze
+  mm_calc_data <- eventReactive(input$mm_analyze, {
+    req(tm_data)
+    
+    hitter_list <- if (length(input$mm_hitters) > 0) {
+      lapply(input$mm_hitters, function(h) {
+        hd <- tm_data[tm_data$Batter == h, , drop = FALSE]
+        if (nrow(hd) == 0) return(NULL)
+        list(name = h, splits = mm_calc_all_splits(hd, "mean_DRE_bat", is_pitcher = FALSE), data = hd, n = nrow(hd))
+      })
+    } else NULL
+    hitter_list <- Filter(Negate(is.null), hitter_list)
+    if (length(hitter_list) > 0) names(hitter_list) <- sapply(hitter_list, `[[`, "name")
+    
+    pitcher_list <- if (length(input$mm_pitchers) > 0) {
+      lapply(input$mm_pitchers, function(p) {
+        pd <- tm_data[tm_data$Pitcher == p, , drop = FALSE]
+        if (nrow(pd) == 0) return(NULL)
+        list(name = p, splits = mm_calc_all_splits(pd, "mean_DRE_pit", is_pitcher = TRUE), data = pd, n = nrow(pd))
+      })
+    } else NULL
+    pitcher_list <- Filter(Negate(is.null), pitcher_list)
+    if (length(pitcher_list) > 0) names(pitcher_list) <- sapply(pitcher_list, `[[`, "name")
+    
+    list(hitters = hitter_list, pitchers = pitcher_list)
+  })
+  
+  # Get display splits helper
+  mm_get_display_splits <- function() {
+    splits <- unlist(MM_DISPLAY_GROUPS[input$mm_split_groups], use.names = FALSE)
+    splits[splits %in% names(MM_ALL_SPLITS)]
+  }
+  
+  # Main results table
+  output$mm_results_table <- render_gt({
+    req(mm_calc_data())
+    cd <- mm_calc_data()
+    
+    # Matrix Overall
+    if (input$mm_view_mode == "matrix_overall") {
+      req(cd$hitters, cd$pitchers)
+      
+      mat <- matrix(NA_real_, nrow = length(cd$hitters), ncol = length(cd$pitchers))
+      conf_mat <- matrix(NA_real_, nrow = length(cd$hitters), ncol = length(cd$pitchers))
+      rownames(mat) <- names(cd$hitters)
+      colnames(mat) <- names(cd$pitchers)
+      
+      for (i in seq_along(cd$hitters)) {
+        h <- cd$hitters[[i]]
+        for (j in seq_along(cd$pitchers)) {
+          p <- cd$pitchers[[j]]
+          overall <- mm_calc_overall_matchup(h$splits, p$splits, p$data)
+          mat[i, j] <- round(overall$rv, 2)
+          conf_mat[i, j] <- overall$confidence
+        }
+      }
+      
+      as.data.frame(mat) %>%
+        tibble::rownames_to_column("Hitter") %>%
+        gt() %>%
+        tab_header(title = "Overall Matchup Matrix", subtitle = "Positive = hitter advantage | Confidence-weighted") %>%
+        data_color(columns = -Hitter, fn = scales::col_numeric(
+          palette = c("#c0392b", "#e74c3c", "#f5f5f5", "#27ae60", "#1e8449"),
+          domain = c(-10, -3, 0, 3, 10), na.color = "#eee")) %>%
+        cols_align(align = "center") %>%
+        tab_options(
+          table.font.size = "14px",
+          heading.subtitle.font.size = "12px",
+          column_labels.font.weight = "bold",
+          column_labels.background.color = "#e8f5f4"
+        ) %>%
+        tab_style(style = cell_text(weight = "bold"), locations = cells_body(columns = "Hitter"))
+    }
+    
+    # Matrix by Split
+    else if (input$mm_view_mode == "matrix_split") {
+      req(cd$hitters, cd$pitchers, input$mm_selected_split)
+      s <- input$mm_selected_split
+      
+      mat <- matrix(NA_real_, nrow = length(cd$hitters), ncol = length(cd$pitchers))
+      rownames(mat) <- names(cd$hitters)
+      colnames(mat) <- names(cd$pitchers)
+      
+      for (i in seq_along(cd$hitters)) {
+        h <- cd$hitters[[i]]
+        for (j in seq_along(cd$pitchers)) {
+          p <- cd$pitchers[[j]]
+          m <- mm_calc_matchup(h$splits[[s]]$rv100, p$splits[[s]]$rv100, 
+                              h$splits[[s]]$weight, p$splits[[s]]$weight)
+          mat[i, j] <- round(m$weighted, 2)
+        }
+      }
+      
+      as.data.frame(mat) %>%
+        tibble::rownames_to_column("Hitter") %>%
+        gt() %>%
+        tab_header(title = paste("Matchup:", MM_ALL_SPLITS[[s]]$name), subtitle = "Positive = hitter advantage | Confidence-weighted") %>%
+        data_color(columns = -Hitter, fn = scales::col_numeric(
+          palette = c("#c0392b", "#e74c3c", "#f5f5f5", "#27ae60", "#1e8449"),
+          domain = c(-10, -3, 0, 3, 10), na.color = "#eee")) %>%
+        cols_align(align = "center") %>%
+        tab_options(
+          table.font.size = "14px",
+          heading.subtitle.font.size = "12px",
+          column_labels.font.weight = "bold",
+          column_labels.background.color = "#e8f5f4"
+        ) %>%
+        tab_style(style = cell_text(weight = "bold"), locations = cells_body(columns = "Hitter"))
+    }
+    
+    # Hitter Profiles
+    else if (input$mm_view_mode == "hitter_profiles") {
+      req(cd$hitters)
+      display_splits <- mm_get_display_splits()
+      
+      rows <- lapply(cd$hitters, function(h) {
+        vals <- sapply(display_splits, function(s) round(h$splits[[s]]$rv100, 2))
+        confs <- sapply(display_splits, function(s) h$splits[[s]]$weight)
+        ns <- sapply(display_splits, function(s) h$splits[[s]]$n)
+        c(Hitter = h$name, N = nrow(h$data), vals)
+      })
+      
+      df <- do.call(rbind, rows) %>% as.data.frame()
+      names(df) <- c("Hitter", "N", sapply(display_splits, function(s) MM_ALL_SPLITS[[s]]$name))
+      df$N <- as.integer(df$N)
+      for (col in names(df)[3:ncol(df)]) df[[col]] <- as.numeric(df[[col]])
+      
+      df %>%
+        gt() %>%
+        tab_header(title = "Hitter Profiles", subtitle = "RV/100 (positive = good for hitter) | Hierarchically regressed") %>%
+        data_color(columns = 3:ncol(df), fn = scales::col_numeric(
+          palette = c("#c0392b", "#e74c3c", "#f5f5f5", "#27ae60", "#1e8449"),
+          domain = c(-15, -5, 0, 5, 15), na.color = "#eee")) %>%
+        cols_align(align = "center") %>%
+        tab_options(
+          table.font.size = "13px",
+          heading.subtitle.font.size = "12px",
+          column_labels.font.weight = "bold",
+          column_labels.background.color = "#e8f5f4"
+        ) %>%
+        tab_style(style = cell_text(weight = "bold"), locations = cells_body(columns = "Hitter"))
+    }
+    
+    # Pitcher Profiles
+    else if (input$mm_view_mode == "pitcher_profiles") {
+      req(cd$pitchers)
+      display_splits <- mm_get_display_splits()
+      
+      rows <- lapply(cd$pitchers, function(p) {
+        vals <- sapply(display_splits, function(s) round(p$splits[[s]]$rv100, 2))
+        c(Pitcher = p$name, N = nrow(p$data), vals)
+      })
+      
+      df <- do.call(rbind, rows) %>% as.data.frame()
+      names(df) <- c("Pitcher", "N", sapply(display_splits, function(s) MM_ALL_SPLITS[[s]]$name))
+      df$N <- as.integer(df$N)
+      for (col in names(df)[3:ncol(df)]) df[[col]] <- as.numeric(df[[col]])
+      
+      df %>%
+        gt() %>%
+        tab_header(title = "Pitcher Profiles", subtitle = "RV/100 (negative = good for pitcher) | Hierarchically regressed") %>%
+        data_color(columns = 3:ncol(df), fn = scales::col_numeric(
+          palette = c("#1e8449", "#27ae60", "#f5f5f5", "#e74c3c", "#c0392b"),
+          domain = c(-15, -5, 0, 5, 15), na.color = "#eee")) %>%
+        cols_align(align = "center") %>%
+        tab_options(
+          table.font.size = "13px",
+          heading.subtitle.font.size = "12px",
+          column_labels.font.weight = "bold",
+          column_labels.background.color = "#e8f5f4"
+        ) %>%
+        tab_style(style = cell_text(weight = "bold"), locations = cells_body(columns = "Pitcher"))
+    }
+  })
+  
+  # Helper function to generate a gt table for a specific view
+  mm_generate_gt_table <- function(view_mode, split_name = NULL, custom_splits = NULL) {
+    cd <- mm_calc_data()
+    if (is.null(cd)) return(NULL)
+    
+    display_splits <- if (!is.null(custom_splits)) {
+      custom_splits
+    } else {
+      mm_get_display_splits()
+    }
+    
+    if (view_mode == "matrix_overall") {
+      if (is.null(cd$hitters) || is.null(cd$pitchers)) return(NULL)
+      
+      mat <- matrix(NA_real_, nrow = length(cd$hitters), ncol = length(cd$pitchers))
+      rownames(mat) <- names(cd$hitters)
+      colnames(mat) <- names(cd$pitchers)
+      
+      for (i in seq_along(cd$hitters)) {
+        h <- cd$hitters[[i]]
+        for (j in seq_along(cd$pitchers)) {
+          p <- cd$pitchers[[j]]
+          overall <- mm_calc_overall_matchup(h$splits, p$splits, p$data)
+          mat[i, j] <- round(overall$rv, 2)
+        }
+      }
+      
+      as.data.frame(mat) %>%
+        tibble::rownames_to_column("Hitter") %>%
+        gt() %>%
+        tab_header(title = "Overall Matchup Matrix", subtitle = "Positive = hitter advantage | Confidence-weighted") %>%
+        data_color(columns = -Hitter, fn = scales::col_numeric(
+          palette = c("#c0392b", "#e74c3c", "#f5f5f5", "#27ae60", "#1e8449"),
+          domain = c(-10, -3, 0, 3, 10), na.color = "#eee")) %>%
+        cols_align(align = "center") %>%
+        tab_options(table.font.size = "14px", column_labels.font.weight = "bold", column_labels.background.color = "#e8f5f4") %>%
+        tab_style(style = cell_text(weight = "bold"), locations = cells_body(columns = "Hitter"))
+    }
+    
+    else if (view_mode == "matrix_split" && !is.null(split_name)) {
+      if (is.null(cd$hitters) || is.null(cd$pitchers)) return(NULL)
+      s <- split_name
+      
+      mat <- matrix(NA_real_, nrow = length(cd$hitters), ncol = length(cd$pitchers))
+      rownames(mat) <- names(cd$hitters)
+      colnames(mat) <- names(cd$pitchers)
+      
+      for (i in seq_along(cd$hitters)) {
+        h <- cd$hitters[[i]]
+        for (j in seq_along(cd$pitchers)) {
+          p <- cd$pitchers[[j]]
+          m <- mm_calc_matchup(h$splits[[s]]$rv100, p$splits[[s]]$rv100, h$splits[[s]]$weight, p$splits[[s]]$weight)
+          mat[i, j] <- round(m$weighted, 2)
+        }
+      }
+      
+      as.data.frame(mat) %>%
+        tibble::rownames_to_column("Hitter") %>%
+        gt() %>%
+        tab_header(title = paste("Matchup:", MM_ALL_SPLITS[[s]]$name), subtitle = "Positive = hitter advantage | Confidence-weighted") %>%
+        data_color(columns = -Hitter, fn = scales::col_numeric(
+          palette = c("#c0392b", "#e74c3c", "#f5f5f5", "#27ae60", "#1e8449"),
+          domain = c(-10, -3, 0, 3, 10), na.color = "#eee")) %>%
+        cols_align(align = "center") %>%
+        tab_options(table.font.size = "14px", column_labels.font.weight = "bold", column_labels.background.color = "#e8f5f4") %>%
+        tab_style(style = cell_text(weight = "bold"), locations = cells_body(columns = "Hitter"))
+    }
+    
+    else if (view_mode == "hitter_profiles") {
+      if (is.null(cd$hitters) || length(display_splits) == 0) return(NULL)
+      
+      rows <- lapply(cd$hitters, function(h) {
+        vals <- sapply(display_splits, function(s) round(h$splits[[s]]$rv100, 2))
+        c(Hitter = h$name, N = nrow(h$data), vals)
+      })
+      
+      df <- do.call(rbind, rows) %>% as.data.frame()
+      names(df) <- c("Hitter", "N", sapply(display_splits, function(s) MM_ALL_SPLITS[[s]]$name))
+      df$N <- as.integer(df$N)
+      for (col in names(df)[3:ncol(df)]) df[[col]] <- as.numeric(df[[col]])
+      
+      df %>%
+        gt() %>%
+        tab_header(title = "Hitter Profiles", subtitle = "RV/100 (positive = good for hitter) | Hierarchically regressed") %>%
+        data_color(columns = 3:ncol(df), fn = scales::col_numeric(
+          palette = c("#c0392b", "#e74c3c", "#f5f5f5", "#27ae60", "#1e8449"),
+          domain = c(-15, -5, 0, 5, 15), na.color = "#eee")) %>%
+        cols_align(align = "center") %>%
+        tab_options(table.font.size = "13px", column_labels.font.weight = "bold", column_labels.background.color = "#e8f5f4") %>%
+        tab_style(style = cell_text(weight = "bold"), locations = cells_body(columns = "Hitter"))
+    }
+    
+    else if (view_mode == "pitcher_profiles") {
+      if (is.null(cd$pitchers) || length(display_splits) == 0) return(NULL)
+      
+      rows <- lapply(cd$pitchers, function(p) {
+        vals <- sapply(display_splits, function(s) round(p$splits[[s]]$rv100, 2))
+        c(Pitcher = p$name, N = nrow(p$data), vals)
+      })
+      
+      df <- do.call(rbind, rows) %>% as.data.frame()
+      names(df) <- c("Pitcher", "N", sapply(display_splits, function(s) MM_ALL_SPLITS[[s]]$name))
+      df$N <- as.integer(df$N)
+      for (col in names(df)[3:ncol(df)]) df[[col]] <- as.numeric(df[[col]])
+      
+      df %>%
+        gt() %>%
+        tab_header(title = "Pitcher Profiles", subtitle = "RV/100 (negative = good for pitcher) | Hierarchically regressed") %>%
+        data_color(columns = 3:ncol(df), fn = scales::col_numeric(
+          palette = c("#1e8449", "#27ae60", "#f5f5f5", "#e74c3c", "#c0392b"),
+          domain = c(-15, -5, 0, 5, 15), na.color = "#eee")) %>%
+        cols_align(align = "center") %>%
+        tab_options(table.font.size = "13px", column_labels.font.weight = "bold", column_labels.background.color = "#e8f5f4") %>%
+        tab_style(style = cell_text(weight = "bold"), locations = cells_body(columns = "Pitcher"))
+    }
+    
+    else {
+      NULL
+    }
+  }
+  
+  # Download PNG of current view
+  output$mm_download_png <- downloadHandler(
+    filename = function() {
+      paste0("matchup_", input$mm_view_mode, "_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".png")
+    },
+    content = function(file) {
+      gt_tbl <- mm_generate_gt_table(input$mm_view_mode, input$mm_selected_split)
+      if (!is.null(gt_tbl)) {
+        gtsave(gt_tbl, file, vwidth = 1200)
+      }
+    }
+  )
+  
+  # Download PDF with all views
+  output$mm_download_pdf <- downloadHandler(
+    filename = function() {
+      paste0("matchup_report_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".pdf")
+    },
+    content = function(file) {
+      temp_dir <- tempdir()
+      img_files <- list()
+      
+      # Define pitch family and platoon splits
+      family_platoon_splits <- c("fb_rhp", "bb_rhp", "os_rhp", "fb_lhp", "bb_lhp", "os_lhp", "vs_rhp", "vs_lhp", "overall")
+      
+      # Generate tables
+      tables_to_generate <- list(
+        list(name = "Overall Matrix", view = "matrix_overall", splits = NULL),
+        list(name = "Hitter Profiles (Movement)", view = "hitter_profiles", splits = mm_get_display_splits()),
+        list(name = "Pitcher Profiles (Movement)", view = "pitcher_profiles", splits = mm_get_display_splits()),
+        list(name = "Hitter Profiles (Family/Platoon)", view = "hitter_profiles", splits = family_platoon_splits),
+        list(name = "Pitcher Profiles (Family/Platoon)", view = "pitcher_profiles", splits = family_platoon_splits)
+      )
+      
+      for (tbl_info in tables_to_generate) {
+        gt_tbl <- mm_generate_gt_table(tbl_info$view, NULL, tbl_info$splits)
+        if (!is.null(gt_tbl)) {
+          img_path <- file.path(temp_dir, paste0(gsub("[^a-zA-Z0-9]", "_", tbl_info$name), ".png"))
+          tryCatch({
+            gtsave(gt_tbl, img_path, vwidth = 1400)
+            img_files[[tbl_info$name]] <- img_path
+          }, error = function(e) {
+            message("Error saving ", tbl_info$name, ": ", e$message)
+          })
+        }
+      }
+      
+      # Build HTML content with custom inputs
+      report_title <- if (nchar(input$mm_pdf_title) > 0) input$mm_pdf_title else "Matchup Matrix Report"
+      best_matchups <- input$mm_pdf_best_matchups
+      worst_matchups <- input$mm_pdf_worst_matchups
+      notes <- input$mm_pdf_notes
+      
+      html_content <- paste0(
+        '<!DOCTYPE html><html><head>',
+        '<style>',
+        '@page { size: letter landscape; margin: 0.5in; }',
+        'body { font-family: Arial, sans-serif; margin: 0; padding: 20px; }',
+        '.header { text-align: center; margin-bottom: 30px; padding-bottom: 20px; border-bottom: 3px solid #006F71; }',
+        'h1 { color: #006F71; margin: 0 0 10px; font-size: 28px; }',
+        '.timestamp { color: #666; font-size: 12px; }',
+        '.notes-section { background: #f8f9fa; border-radius: 8px; padding: 20px; margin-bottom: 30px; }',
+        '.notes-section h3 { color: #006F71; margin: 0 0 10px; font-size: 16px; }',
+        '.notes-row { display: flex; gap: 20px; margin-bottom: 15px; }',
+        '.notes-box { flex: 1; }',
+        '.notes-box h4 { color: #CD853F; margin: 0 0 8px; font-size: 14px; }',
+        '.notes-box p { margin: 0; font-size: 13px; line-height: 1.5; white-space: pre-wrap; }',
+        '.matchups-good { border-left: 4px solid #27ae60; padding-left: 12px; }',
+        '.matchups-bad { border-left: 4px solid #c0392b; padding-left: 12px; }',
+        '.table-section { margin-bottom: 40px; page-break-inside: avoid; }',
+        '.table-section h3 { color: #006F71; font-size: 16px; margin-bottom: 15px; }',
+        'img { max-width: 100%; height: auto; }',
+        '</style>',
+        '</head><body>',
+        '<div class="header">',
+        '<h1>', htmltools::htmlEscape(report_title), '</h1>',
+        '<p class="timestamp">Generated: ', format(Sys.time(), "%B %d, %Y at %I:%M %p"), '</p>',
+        '</div>'
+      )
+      
+      # Add notes section if any content provided
+      if (nchar(best_matchups) > 0 || nchar(worst_matchups) > 0 || nchar(notes) > 0) {
+        html_content <- paste0(html_content, '<div class="notes-section">')
+        
+        if (nchar(best_matchups) > 0 || nchar(worst_matchups) > 0) {
+          html_content <- paste0(html_content, '<div class="notes-row">')
+          
+          if (nchar(best_matchups) > 0) {
+            html_content <- paste0(html_content,
+              '<div class="notes-box matchups-good">',
+              '<h4>Best Matchups</h4>',
+              '<p>', htmltools::htmlEscape(best_matchups), '</p>',
+              '</div>')
+          }
+          
+          if (nchar(worst_matchups) > 0) {
+            html_content <- paste0(html_content,
+              '<div class="notes-box matchups-bad">',
+              '<h4>Worst Matchups</h4>',
+              '<p>', htmltools::htmlEscape(worst_matchups), '</p>',
+              '</div>')
+          }
+          
+          html_content <- paste0(html_content, '</div>')
+        }
+        
+        if (nchar(notes) > 0) {
+          html_content <- paste0(html_content,
+            '<div class="notes-box">',
+            '<h4>Notes</h4>',
+            '<p>', htmltools::htmlEscape(notes), '</p>',
+            '</div>')
+        }
+        
+        html_content <- paste0(html_content, '</div>')
+      }
+      
+      # Add table images
+      for (tbl_name in names(img_files)) {
+        img_path <- img_files[[tbl_name]]
+        if (file.exists(img_path)) {
+          img_data <- base64enc::base64encode(img_path)
+          html_content <- paste0(html_content,
+            '<div class="table-section">',
+            '<h3>', htmltools::htmlEscape(tbl_name), '</h3>',
+            '<img src="data:image/png;base64,', img_data, '">',
+            '</div>')
+        }
+      }
+      
+      html_content <- paste0(html_content, '</body></html>')
+      
+      html_file <- file.path(temp_dir, "report.html")
+      writeLines(html_content, html_file)
+      
+      # Convert to PDF
+      tryCatch({
+        pagedown::chrome_print(html_file, file, wait = 15)
+      }, error = function(e) {
+        message("PDF generation error: ", e$message)
+        # Fallback: copy first image
+        if (length(img_files) > 0) {
+          file.copy(img_files[[1]], file)
+        }
+      })
+    }
+  )
+  
+  # ============================================================================
+  # END MATCHUP MATRICES TAB
+  # ============================================================================
+
 output$download_scout_pdf <- downloadHandler(
     filename = function() { paste0("scouting_report_", format(Sys.Date(), "%Y%m%d"), ".pdf") },
     content = function(file) {
