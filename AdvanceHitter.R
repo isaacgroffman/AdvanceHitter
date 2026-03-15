@@ -1,3 +1,11 @@
+# Force Chrome flags BEFORE loading chromote
+Sys.setenv(CHROMOTE_CHROME = "/usr/bin/google-chrome-stable")
+
+options(shiny.error = function() {
+  message(geterrmessage())
+})
+
+Sys.setenv(RETICULATE_PYTHON = "/usr/bin/python3")
 library(shiny)
 library(shinydashboard)
 library(shinyWidgets)
@@ -10,6 +18,19 @@ library(arrow)
 library(httr)
 library(gt)
 library(base64enc)
+library(patchwork)
+library(webshot2)
+library(chromote)
+library(png)
+library(htmltools)
+library(reticulate)
+
+# Configure chromote to run in container
+set_default_chromote_object(
+  Chromote$new(browser = Chrome$new(args = c("--no-sandbox", "--disable-gpu", "--headless", "--disable-dev-shm-usage")))
+)
+
+options(shiny.sanitize.errors = FALSE)
 
 # Suppress jsonlite warnings about named vectors (cosmetic, doesn't affect functionality)
 options(shiny.sanitize.errors = FALSE)
@@ -86,6 +107,51 @@ download_private_parquet <- function(repo_id, filename) {
   }
 }
 
+clean_bind <- function(data) {
+  data <- data %>% 
+    mutate(
+      Date = as.Date(Date),
+      across(any_of(c("Time", "Tilt", "UTCTime", "LocalDateTime", "UTCDateTime",
+                      "CatchPositionX", "CatchPositionY", "CatchPositionZ",
+                      "ThrowPositionX", "ThrowPositionY", "ThrowPositionZ",
+                      "BasePositionX", "BasePositionY", "BasePositionZ")), as.character),
+      across(starts_with("ThrowTrajectory"), as.character)
+    )
+  
+  if ("UTCDate" %in% names(data)) data$UTCDate <- as.Date(data$UTCDate)
+  
+  data
+}
+
+download_master_dataset <- function(repo_id, folder, token = Sys.getenv("HF_Token")) {
+  hf <- reticulate::import("huggingface_hub")
+  api <- hf$HfApi()
+  
+  files <- api$list_repo_files(repo_id = repo_id, repo_type = "dataset", token = token)
+  pq_files <- files[grepl(paste0("^", folder, "/.*\\.parquet$"), files)]
+  
+  if (length(pq_files) == 0) return(data.frame())
+  
+  all_data <- lapply(pq_files, function(f) {
+    url <- paste0("https://huggingface.co/datasets/", repo_id, "/resolve/main/", f)
+    resp <- httr::GET(url, httr::add_headers(Authorization = paste("Bearer", token)))
+    if (httr::status_code(resp) == 200) {
+      tmp <- tempfile(fileext = ".parquet")
+      writeBin(httr::content(resp, as = "raw"), tmp)
+      d <- arrow::read_parquet(tmp)
+      file.remove(tmp)
+      d
+    } else NULL
+  })
+  
+  combined <- bind_rows(Filter(Negate(is.null), lapply(all_data, clean_bind)))
+  
+  if ("PitchUID" %in% names(combined)) {
+    combined <- combined %>% distinct(PitchUID, .keep_all = TRUE)
+  }
+  
+  combined
+}
 
 
 
@@ -125,7 +191,7 @@ gc(verbose = FALSE, full = TRUE)
 
 
 tm_data <- download_private_parquet("CoastalBaseball/AdvanceHitter", "new_college_data25.parquet")
-
+data_2026 <- download_master_dataset("CoastalBaseball/2026MasterDataset", "pbp")
 
 # SEC Teams for percentile comparison pool
 sec_teams <- c("ALA_CRI", "ARK_RAZ", "AUB_TIG", "FLA_GAT", "GEO_BUL", "KEN_WIL", "LSU_TIG", "OLE_REB",
@@ -173,7 +239,7 @@ if (exists("TM2025")) {
   pitchers <- paste0("Pitcher_", LETTERS[1:10])
   hitters <- paste0("Hitter_", 1:30)
   pitch_types <- c("Fastball", "Sinker", "Slider", "Curveball", "Changeup", "Cutter")
-  
+  }
 
 cat("Loaded", nrow(tm_data), "rows\n")
 
@@ -194,6 +260,7 @@ benchmarks <- list(
 # ============================================================================
 # HELPER FUNCTIONS
 # ============================================================================
+
 
 classify_pitch_family <- function(pitch_type) {
   case_when(
@@ -285,6 +352,12 @@ add_indicators <- function(df) {
 
 tm_data <- add_indicators(tm_data)
 
+if (median(abs(data_2026$PlateLocSide), na.rm = TRUE) > 5) {
+  data_2026 <- data_2026 %>% mutate(PlateLocSide = PlateLocSide / 12, PlateLocHeight = PlateLocHeight / 12)
+}
+
+data_2026 <- add_indicators(data_2026)
+
 all_hitters <- sort(unique(tm_data$Batter))
 all_pitchers <- sort(unique(tm_data$Pitcher))
 
@@ -307,32 +380,269 @@ d1_pool_data <- tm_data
 # Clean up memory
 gc(verbose = FALSE)
 
+# Determine "in" side for a batter
+get_in_side <- function(batter_side) {
+  if (batter_side == "Right") return("negative")
+  return("positive")
+}
+
+mm_fast_filter <- function(df, config, is_pitcher = FALSE, batter_side = NULL) {
+  if (nrow(df) == 0) return(df)
+  mask <- rep(TRUE, nrow(df))
+  if (!is.null(config$pitch_types)) mask <- mask & df$TaggedPitchType %in% config$pitch_types
+  if (!is.null(config$pitcher_hand)) {
+    if (is_pitcher) {
+      bs <- ifelse(config$pitcher_hand == "Right", "Right", "Left")
+      if ("BatterSide" %in% names(df)) mask <- mask & df$BatterSide == bs
+    } else {
+      mask <- mask & df$PitcherThrows == config$pitcher_hand
+    }
+  }
+  if (!is.null(config$ivb_min)) mask <- mask & !is.na(df$InducedVertBreak) & df$InducedVertBreak >= config$ivb_min
+  if (!is.null(config$ivb_max)) mask <- mask & !is.na(df$InducedVertBreak) & df$InducedVertBreak <= config$ivb_max
+  hb <- if (!is.null(config$use_abs_hb) && config$use_abs_hb) abs(df$HorzBreak) else df$HorzBreak
+  if (!is.null(config$hb_min)) mask <- mask & !is.na(hb) & hb >= config$hb_min
+  if (!is.null(config$hb_max)) mask <- mask & !is.na(hb) & hb <= config$hb_max
+  if (!is.null(config$velo_min)) mask <- mask & !is.na(df$RelSpeed) & df$RelSpeed >= config$velo_min
+  if (!is.null(config$velo_max)) mask <- mask & !is.na(df$RelSpeed) & df$RelSpeed <= config$velo_max
+  
+  # --- LOCATION FILTERS ---
+  zone_mid_height <- 2.5
+  if (is.null(batter_side) && "BatterSide" %in% names(df) && sum(mask) > 0) {
+    sides <- df$BatterSide[mask]; sides <- sides[!is.na(sides)]
+    if (length(sides) > 0) batter_side <- names(sort(table(sides), decreasing = TRUE))[1]
+  }
+  if (!is.null(config$loc_up) && config$loc_up) mask <- mask & !is.na(df$PlateLocHeight) & df$PlateLocHeight >= zone_mid_height
+  if (!is.null(config$loc_down) && config$loc_down) mask <- mask & !is.na(df$PlateLocHeight) & df$PlateLocHeight < zone_mid_height
+  if (!is.null(config$loc_elevated) && config$loc_elevated) mask <- mask & !is.na(df$PlateLocHeight) & df$PlateLocHeight >= 2.8667
+  if (!is.null(config$loc_heart) && config$loc_heart) {
+    mask <- mask & !is.na(df$PlateLocSide) & !is.na(df$PlateLocHeight) & abs(df$PlateLocSide) <= 0.55 & df$PlateLocHeight >= 1.83 & df$PlateLocHeight <= 3.17
+  }
+  if (!is.null(config$loc_in) && config$loc_in && !is.null(batter_side)) {
+    in_dir <- get_in_side(batter_side)
+    if (in_dir == "negative") mask <- mask & !is.na(df$PlateLocSide) & df$PlateLocSide < 0
+    else mask <- mask & !is.na(df$PlateLocSide) & df$PlateLocSide > 0
+  }
+  if (!is.null(config$loc_away) && config$loc_away && !is.null(batter_side)) {
+    in_dir <- get_in_side(batter_side)
+    if (in_dir == "negative") mask <- mask & !is.na(df$PlateLocSide) & df$PlateLocSide >= 0
+    else mask <- mask & !is.na(df$PlateLocSide) & df$PlateLocSide <= 0
+  }
+  df[mask, , drop = FALSE]
+}
+
+mm_calc_rv_stats <- function(df, rv_col) {
+  rv <- df[[rv_col]][!is.na(df[[rv_col]])]
+  n <- length(rv)
+  if (n == 0) return(list(rv100 = NA_real_, n = 0L))
+  list(rv100 = 100 * mean(rv), n = n)
+}
+
+mm_calc_hierarchical_rv <- function(player_data, rv_col, split_name, is_pitcher = FALSE, batter_side = NULL) {
+  config <- MM_ALL_SPLITS[[split_name]]
+  if (is.null(config)) return(list(rv100 = 0, n = 0, weight = 0, raw_rv100 = NA_real_))
+  filtered <- mm_fast_filter(player_data, config, is_pitcher, batter_side)
+  stats <- mm_calc_rv_stats(filtered, rv_col)
+  weight <- min(stats$n / config$threshold, 1)
+  if (weight >= 1 || is.null(config$fallback)) {
+    return(list(rv100 = ifelse(is.na(stats$rv100), 0, stats$rv100), n = stats$n, weight = weight, raw_rv100 = stats$rv100))
+  }
+  fallback <- mm_calc_hierarchical_rv(player_data, rv_col, config$fallback, is_pitcher, batter_side)
+  this_rv <- ifelse(is.na(stats$rv100), 0, stats$rv100)
+  blended <- weight * this_rv + (1 - weight) * fallback$rv100
+  list(rv100 = blended, n = stats$n, weight = weight, raw_rv100 = stats$rv100)
+}
+
+mm_calc_all_splits <- function(player_data, rv_col, is_pitcher = FALSE, batter_side = NULL) {
+  results <- lapply(names(MM_ALL_SPLITS), function(s) {
+    res <- mm_calc_hierarchical_rv(player_data, rv_col, s, is_pitcher, batter_side)
+    res$name <- MM_ALL_SPLITS[[s]]$name
+    res
+  })
+  names(results) <- names(MM_ALL_SPLITS)
+  results
+}
+
+mm_calc_matchup <- function(h_rv, p_rv, h_w, p_w) {
+  combined_conf <- h_w * p_w
+  raw <- h_rv - p_rv
+  weighted <- combined_conf * raw + (1 - combined_conf) * 0
+  list(raw = raw, weighted = weighted, confidence = combined_conf)
+}
+
+mm_calc_overall_matchup <- function(h_splits, p_splits, p_data, include_location = FALSE) {
+  total <- nrow(p_data)
+  if (total == 0) return(list(rv = NA_real_, confidence = 0))
+  split_configs <- MM_SPLIT_CONFIG
+  if (include_location) split_configs <- c(split_configs, MM_LOCATION_CONFIG)
+  wsum <- 0; csum <- 0; tweight <- 0
+  for (s in names(split_configs)) {
+    n_split <- nrow(mm_fast_filter(p_data, split_configs[[s]], is_pitcher = TRUE))
+    usage <- n_split / total
+    if (usage > 0 && s %in% names(h_splits) && s %in% names(p_splits)) {
+      m <- mm_calc_matchup(h_splits[[s]]$rv100, p_splits[[s]]$rv100, h_splits[[s]]$weight, p_splits[[s]]$weight)
+      wsum <- wsum + m$weighted * usage
+      csum <- csum + m$confidence * usage
+      tweight <- tweight + usage
+    }
+  }
+  if (tweight > 0) list(rv = wsum / tweight, confidence = csum / tweight) else list(rv = NA_real_, confidence = 0)
+}
+
 # ============================================================================
-# MATCHUP MATRIX CONFIGURATIONS
+# PITCHER-HITTER DETAILED MATCHUP ANALYSIS
+# ============================================================================
+
+identify_pitcher_arsenal <- function(pitcher_data) {
+  if (nrow(pitcher_data) < 20) return(NULL)
+  arsenal <- pitcher_data %>%
+    filter(!is.na(TaggedPitchType)) %>%
+    group_by(TaggedPitchType) %>%
+    summarise(
+      n = n(), pct = n() / nrow(pitcher_data) * 100,
+      avg_velo = mean(RelSpeed, na.rm = TRUE),
+      avg_ivb = mean(InducedVertBreak, na.rm = TRUE),
+      avg_hb = mean(HorzBreak, na.rm = TRUE),
+      .groups = "drop"
+    ) %>% filter(pct >= 3) %>% arrange(desc(pct))
+  
+  arsenal <- arsenal %>% mutate(
+    family = classify_pitch_family(TaggedPitchType),
+    movement_tag = case_when(
+      family == "FB" & avg_ivb >= 18 ~ "Ride",
+      family == "FB" & avg_ivb < 9 & abs(avg_hb) >= 10 ~ "Sink",
+      family == "FB" & avg_velo >= 92 ~ "Hard Velo",
+      family == "FB" & avg_velo <= 88 ~ "Soft",
+      family == "FB" ~ "FB",
+      TaggedPitchType %in% c("Slider", "Sweeper", "SL", "SW") & abs(avg_hb) >= 14 ~ "Sweep",
+      TaggedPitchType %in% c("Slider", "Sweeper", "SL", "SW") ~ "Slider",
+      TaggedPitchType %in% c("Curveball", "CU", "CB", "KC") & avg_ivb <= -6 ~ "Downer",
+      TaggedPitchType %in% c("Curveball", "CU", "CB", "KC") ~ "Curveball",
+      TaggedPitchType %in% c("Slurve", "SV") ~ "Slurve",
+      TaggedPitchType %in% c("Cutter", "FC") ~ "Cutter",
+      family == "OS" ~ "CH/SPL",
+      TRUE ~ "Other"
+    )
+  )
+  arsenal
+}
+
+map_pitch_to_split_key <- function(movement_tag, pitcher_hand) {
+  hand_suffix <- ifelse(pitcher_hand == "Right", "_rhp", "_lhp")
+  switch(movement_tag,
+    "Ride" = paste0("ride_fb", hand_suffix), "Sink" = paste0("sink_fb", hand_suffix),
+    "Hard Velo" = paste0("hard_velo", hand_suffix), "Soft" = paste0("soft_fb", hand_suffix),
+    "FB" = paste0("fb", hand_suffix), "Sweep" = paste0("sweep", hand_suffix),
+    "Slider" = paste0("slider", hand_suffix), "Downer" = paste0("downer", hand_suffix),
+    "Curveball" = paste0("cb", hand_suffix), "Slurve" = paste0("slurve", hand_suffix),
+    "Cutter" = paste0("cut_fb", hand_suffix), "CH/SPL" = paste0("chspl", hand_suffix),
+    "overall")
+}
+
+map_pitch_to_family_key <- function(family, pitcher_hand) {
+  hand_suffix <- ifelse(pitcher_hand == "Right", "_rhp", "_lhp")
+  switch(family, "FB" = paste0("fb", hand_suffix), "BB" = paste0("bb", hand_suffix), "OS" = paste0("os", hand_suffix), "overall")
+}
+
+calc_detailed_matchup <- function(hitter_data, pitcher_data, hitter_splits, pitcher_splits, pitcher_hand) {
+  arsenal <- identify_pitcher_arsenal(pitcher_data)
+  if (is.null(arsenal)) return(NULL)
+  
+  breakdown <- arsenal %>% rowwise() %>% mutate(
+    split_key = map_pitch_to_split_key(movement_tag, pitcher_hand),
+    family_key = map_pitch_to_family_key(family, pitcher_hand),
+    h_rv = if (split_key %in% names(hitter_splits)) hitter_splits[[split_key]]$rv100 else NA_real_,
+    h_n = if (split_key %in% names(hitter_splits)) hitter_splits[[split_key]]$n else 0L,
+    h_weight = if (split_key %in% names(hitter_splits)) hitter_splits[[split_key]]$weight else 0,
+    p_rv = if (split_key %in% names(pitcher_splits)) pitcher_splits[[split_key]]$rv100 else NA_real_,
+    p_n = if (split_key %in% names(pitcher_splits)) pitcher_splits[[split_key]]$n else 0L,
+    p_weight = if (split_key %in% names(pitcher_splits)) pitcher_splits[[split_key]]$weight else 0,
+    h_fam_rv = if (family_key %in% names(hitter_splits)) hitter_splits[[family_key]]$rv100 else NA_real_,
+    matchup_rv = {
+      conf <- h_weight * p_weight
+      raw <- if (!is.na(h_rv) && !is.na(p_rv)) h_rv - p_rv else 0
+      conf * raw + (1 - conf) * 0
+    },
+    weighted_contribution = matchup_rv * (pct / 100)
+  ) %>% ungroup()
+  
+  hand_suffix <- ifelse(pitcher_hand == "Right", "_rhp", "_lhp")
+  platoon_key <- paste0("vs", hand_suffix)
+  
+  list(
+    arsenal = breakdown,
+    platoon_rv = if (platoon_key %in% names(hitter_splits)) hitter_splits[[platoon_key]]$rv100 else NA_real_,
+    family_summary = list(
+      fb = list(rv = if (paste0("fb", hand_suffix) %in% names(hitter_splits)) hitter_splits[[paste0("fb", hand_suffix)]]$rv100 else NA_real_),
+      bb = list(rv = if (paste0("bb", hand_suffix) %in% names(hitter_splits)) hitter_splits[[paste0("bb", hand_suffix)]]$rv100 else NA_real_),
+      os = list(rv = if (paste0("os", hand_suffix) %in% names(hitter_splits)) hitter_splits[[paste0("os", hand_suffix)]]$rv100 else NA_real_)
+    ),
+    overall_rv = sum(breakdown$weighted_contribution, na.rm = TRUE),
+    pitcher_hand = pitcher_hand
+  )
+}
+
+# ============================================================================
+# MATCHUP MATRIX CONFIGURATIONS - EXPANDED
 # ============================================================================
 
 MM_SPLIT_CONFIG <- list(
-  ride_fb_rhp = list(name = "Ride FB (RHP)", pitch_types = c("Fastball", "Four-Seam"), ivb_min = 17, pitcher_hand = "Right", fallback = "fb_rhp", threshold = 80),
-  ride_fb_lhp = list(name = "Ride FB (LHP)", pitch_types = c("Fastball", "Four-Seam"), ivb_min = 17, pitcher_hand = "Left", fallback = "fb_lhp", threshold = 80),
-  sink_fb_rhp = list(name = "Sink FB (RHP)", pitch_types = c("Fastball", "Four-Seam", "Sinker"), ivb_max = 12, hb_min = 10, use_abs_hb = TRUE, pitcher_hand = "Right", fallback = "fb_rhp", threshold = 60),
-  sink_fb_lhp = list(name = "Sink FB (LHP)", pitch_types = c("Fastball", "Four-Seam", "Sinker"), ivb_max = 12, hb_min = 10, use_abs_hb = TRUE, pitcher_hand = "Left", fallback = "fb_lhp", threshold = 60),
+  # Fastball movement splits
+  ride_fb_rhp = list(name = "Ride FB (RHP)", pitch_types = c("Fastball", "Four-Seam"), ivb_min = 18, pitcher_hand = "Right", fallback = "fb_rhp", threshold = 80),
+  ride_fb_lhp = list(name = "Ride FB (LHP)", pitch_types = c("Fastball", "Four-Seam"), ivb_min = 18, pitcher_hand = "Left", fallback = "fb_lhp", threshold = 80),
+  sink_fb_rhp = list(name = "Sink FB (RHP)", pitch_types = c("Fastball", "Four-Seam", "Sinker"), ivb_max = 9, hb_min = 10, use_abs_hb = TRUE, pitcher_hand = "Right", fallback = "fb_rhp", threshold = 60),
+  sink_fb_lhp = list(name = "Sink FB (LHP)", pitch_types = c("Fastball", "Four-Seam", "Sinker"), ivb_max = 9, hb_min = 10, use_abs_hb = TRUE, pitcher_hand = "Left", fallback = "fb_lhp", threshold = 60),
   hard_velo_rhp = list(name = "Hard Velo (RHP)", pitch_types = c("Fastball", "Four-Seam", "Sinker"), velo_min = 92, pitcher_hand = "Right", fallback = "fb_rhp", threshold = 80),
   hard_velo_lhp = list(name = "Hard Velo (LHP)", pitch_types = c("Fastball", "Four-Seam", "Sinker"), velo_min = 92, pitcher_hand = "Left", fallback = "fb_lhp", threshold = 80),
-  sweep_rhp = list(name = "Sweep (RHP)", pitch_types = c("Slider", "Sweeper", "Curveball"), hb_min = 14, use_abs_hb = TRUE, pitcher_hand = "Right", fallback = "bb_rhp", threshold = 60),
-  sweep_lhp = list(name = "Sweep (LHP)", pitch_types = c("Slider", "Sweeper", "Curveball"), hb_min = 14, use_abs_hb = TRUE, pitcher_hand = "Left", fallback = "bb_lhp", threshold = 60),
-  downer_rhp = list(name = "Downer (RHP)", pitch_types = c("Slider", "Curveball", "Sweeper"), ivb_max = -6, pitcher_hand = "Right", fallback = "bb_rhp", threshold = 60),
-  downer_lhp = list(name = "Downer (LHP)", pitch_types = c("Slider", "Curveball", "Sweeper"), ivb_max = -6, pitcher_hand = "Left", fallback = "bb_lhp", threshold = 60),
-  gyro_cut_rhp = list(name = "Gyro/Cut (RHP)", pitch_types = c("Cutter", "Slider"), ivb_min = -3, ivb_max = 6, hb_max = 8, use_abs_hb = TRUE, pitcher_hand = "Right", fallback = "bb_rhp", threshold = 50),
-  gyro_cut_lhp = list(name = "Gyro/Cut (LHP)", pitch_types = c("Cutter", "Slider"), ivb_min = -3, ivb_max = 6, hb_max = 8, use_abs_hb = TRUE, pitcher_hand = "Left", fallback = "bb_lhp", threshold = 50),
-  chspl_rhp = list(name = "CH/SPL (RHP)", pitch_types = c("ChangeUp", "Changeup", "Splitter"), pitcher_hand = "Right", fallback = "os_rhp", threshold = 60),
-  chspl_lhp = list(name = "CH/SPL (LHP)", pitch_types = c("ChangeUp", "Changeup", "Splitter"), pitcher_hand = "Left", fallback = "os_lhp", threshold = 60)
+  soft_fb_rhp = list(name = "Soft FB (RHP)", pitch_types = c("Fastball", "Four-Seam", "Sinker"), velo_max = 88, pitcher_hand = "Right", fallback = "fb_rhp", threshold = 60),
+  soft_fb_lhp = list(name = "Soft FB (LHP)", pitch_types = c("Fastball", "Four-Seam", "Sinker"), velo_max = 88, pitcher_hand = "Left", fallback = "fb_lhp", threshold = 60),
+  cut_fb_rhp = list(name = "Cutter (RHP)", pitch_types = c("Cutter", "FC"), pitcher_hand = "Right", fallback = "fb_rhp", threshold = 50),
+  cut_fb_lhp = list(name = "Cutter (LHP)", pitch_types = c("Cutter", "FC"), pitcher_hand = "Left", fallback = "fb_lhp", threshold = 50),
+  deadzone_fb_rhp = list(name = "Deadzone FB (RHP)", pitch_types = c("Fastball", "Four-Seam", "Sinker"), ivb_min = 10, ivb_max = 16, hb_min = 8, hb_max = 15, use_abs_hb = TRUE, pitcher_hand = "Right", fallback = "fb_rhp", threshold = 60),
+  deadzone_fb_lhp = list(name = "Deadzone FB (LHP)", pitch_types = c("Fastball", "Four-Seam", "Sinker"), ivb_min = 10, ivb_max = 16, hb_min = 8, hb_max = 15, use_abs_hb = TRUE, pitcher_hand = "Left", fallback = "fb_lhp", threshold = 60),
+  
+  # Breaking ball movement splits - EXPANDED
+  sweep_rhp = list(name = "Sweep (RHP)", pitch_types = c("Slider", "Sweeper", "SW", "SL"), hb_min = 14, use_abs_hb = TRUE, pitcher_hand = "Right", fallback = "slider_rhp", threshold = 60),
+  sweep_lhp = list(name = "Sweep (LHP)", pitch_types = c("Slider", "Sweeper", "SW", "SL"), hb_min = 14, use_abs_hb = TRUE, pitcher_hand = "Left", fallback = "slider_lhp", threshold = 60),
+  downer_rhp = list(name = "Downer (RHP)", pitch_types = c("Slider", "Curveball", "Sweeper", "Slurve"), ivb_max = -6, pitcher_hand = "Right", fallback = "cb_rhp", threshold = 60),
+  downer_lhp = list(name = "Downer (LHP)", pitch_types = c("Slider", "Curveball", "Sweeper", "Slurve"), ivb_max = -6, pitcher_hand = "Left", fallback = "cb_lhp", threshold = 60),
+  gyro_cut_rhp = list(name = "Gyro/Cut (RHP)", pitch_types = c("Cutter", "Slider"), ivb_min = -3, ivb_max = 6, hb_max = 8, use_abs_hb = TRUE, pitcher_hand = "Right", fallback = "slider_rhp", threshold = 50),
+  gyro_cut_lhp = list(name = "Gyro/Cut (LHP)", pitch_types = c("Cutter", "Slider"), ivb_min = -3, ivb_max = 6, hb_max = 8, use_abs_hb = TRUE, pitcher_hand = "Left", fallback = "slider_lhp", threshold = 50),
+  
+  # Specific breaking ball type splits - NEW
+  slider_rhp = list(name = "Slider (RHP)", pitch_types = c("Slider", "Sweeper", "SL", "SW"), pitcher_hand = "Right", fallback = "bb_rhp", threshold = 60),
+  slider_lhp = list(name = "Slider (LHP)", pitch_types = c("Slider", "Sweeper", "SL", "SW"), pitcher_hand = "Left", fallback = "bb_lhp", threshold = 60),
+  cb_rhp = list(name = "Curveball (RHP)", pitch_types = c("Curveball", "CU", "CB", "KC"), pitcher_hand = "Right", fallback = "bb_rhp", threshold = 50),
+  cb_lhp = list(name = "Curveball (LHP)", pitch_types = c("Curveball", "CU", "CB", "KC"), pitcher_hand = "Left", fallback = "bb_lhp", threshold = 50),
+  slurve_rhp = list(name = "Slurve (RHP)", pitch_types = c("Slurve", "SV"), pitcher_hand = "Right", fallback = "cb_rhp", threshold = 40),
+  slurve_lhp = list(name = "Slurve (LHP)", pitch_types = c("Slurve", "SV"), pitcher_hand = "Left", fallback = "cb_lhp", threshold = 40),
+  
+  # Offspeed splits
+  chspl_rhp = list(name = "CH/SPL (RHP)", pitch_types = c("ChangeUp", "Changeup", "Splitter", "CH", "FS", "SP"), pitcher_hand = "Right", fallback = "os_rhp", threshold = 60),
+  chspl_lhp = list(name = "CH/SPL (LHP)", pitch_types = c("ChangeUp", "Changeup", "Splitter", "CH", "FS", "SP"), pitcher_hand = "Left", fallback = "os_lhp", threshold = 60)
+)
+
+# --- LOCATION SPLITS (zone quadrants, batter-hand dependent for in/away) ---
+MM_LOCATION_CONFIG <- list(
+  up_rhp = list(name = "Up (RHP)", pitch_types = NULL, pitcher_hand = "Right", loc_up = TRUE, fallback = "vs_rhp", threshold = 80),
+  up_lhp = list(name = "Up (LHP)", pitch_types = NULL, pitcher_hand = "Left", loc_up = TRUE, fallback = "vs_lhp", threshold = 80),
+  down_rhp = list(name = "Down (RHP)", pitch_types = NULL, pitcher_hand = "Right", loc_down = TRUE, fallback = "vs_rhp", threshold = 80),
+  down_lhp = list(name = "Down (LHP)", pitch_types = NULL, pitcher_hand = "Left", loc_down = TRUE, fallback = "vs_lhp", threshold = 80),
+  in_rhp = list(name = "In (RHP)", pitch_types = NULL, pitcher_hand = "Right", loc_in = TRUE, fallback = "vs_rhp", threshold = 80),
+  in_lhp = list(name = "In (LHP)", pitch_types = NULL, pitcher_hand = "Left", loc_in = TRUE, fallback = "vs_lhp", threshold = 80),
+  away_rhp = list(name = "Away (RHP)", pitch_types = NULL, pitcher_hand = "Right", loc_away = TRUE, fallback = "vs_rhp", threshold = 80),
+  away_lhp = list(name = "Away (LHP)", pitch_types = NULL, pitcher_hand = "Left", loc_away = TRUE, fallback = "vs_lhp", threshold = 80),
+  elevated_rhp = list(name = "Elevated (RHP)", pitch_types = NULL, pitcher_hand = "Right", loc_elevated = TRUE, fallback = "up_rhp", threshold = 60),
+  elevated_lhp = list(name = "Elevated (LHP)", pitch_types = NULL, pitcher_hand = "Left", loc_elevated = TRUE, fallback = "up_lhp", threshold = 60),
+  heart_rhp = list(name = "Heart (RHP)", pitch_types = NULL, pitcher_hand = "Right", loc_heart = TRUE, fallback = "vs_rhp", threshold = 80),
+  heart_lhp = list(name = "Heart (LHP)", pitch_types = NULL, pitcher_hand = "Left", loc_heart = TRUE, fallback = "vs_lhp", threshold = 80)
 )
 
 MM_FAMILY_CONFIG <- list(
   fb_rhp = list(name = "All FB (RHP)", pitch_types = c("Fastball", "Four-Seam", "Sinker", "Cutter"), pitcher_hand = "Right", fallback = "vs_rhp", threshold = 100),
   fb_lhp = list(name = "All FB (LHP)", pitch_types = c("Fastball", "Four-Seam", "Sinker", "Cutter"), pitcher_hand = "Left", fallback = "vs_lhp", threshold = 100),
-  bb_rhp = list(name = "All BB (RHP)", pitch_types = c("Slider", "Curveball", "Sweeper", "Cutter"), pitcher_hand = "Right", fallback = "vs_rhp", threshold = 80),
-  bb_lhp = list(name = "All BB (LHP)", pitch_types = c("Slider", "Curveball", "Sweeper", "Cutter"), pitcher_hand = "Left", fallback = "vs_lhp", threshold = 80),
+  bb_rhp = list(name = "All BB (RHP)", pitch_types = c("Slider", "Curveball", "Sweeper", "Cutter", "Slurve"), pitcher_hand = "Right", fallback = "vs_rhp", threshold = 80),
+  bb_lhp = list(name = "All BB (LHP)", pitch_types = c("Slider", "Curveball", "Sweeper", "Cutter", "Slurve"), pitcher_hand = "Left", fallback = "vs_lhp", threshold = 80),
   os_rhp = list(name = "All OS (RHP)", pitch_types = c("ChangeUp", "Changeup", "Splitter"), pitcher_hand = "Right", fallback = "vs_rhp", threshold = 60),
   os_lhp = list(name = "All OS (LHP)", pitch_types = c("ChangeUp", "Changeup", "Splitter"), pitcher_hand = "Left", fallback = "vs_lhp", threshold = 60)
 )
@@ -346,13 +656,20 @@ MM_OVERALL_CONFIG <- list(
   overall = list(name = "Overall", pitch_types = NULL, pitcher_hand = NULL, fallback = NULL, threshold = 200)
 )
 
-MM_ALL_SPLITS <- c(MM_SPLIT_CONFIG, MM_FAMILY_CONFIG, MM_PLATOON_CONFIG, MM_OVERALL_CONFIG)
+MM_ALL_SPLITS <- c(MM_SPLIT_CONFIG, MM_LOCATION_CONFIG, MM_FAMILY_CONFIG, MM_PLATOON_CONFIG, MM_OVERALL_CONFIG)
 
 MM_DISPLAY_GROUPS <- list(
-  "Movement (RHP)" = c("ride_fb_rhp", "sink_fb_rhp", "hard_velo_rhp", "sweep_rhp", "downer_rhp", "gyro_cut_rhp", "chspl_rhp"),
-  "Movement (LHP)" = c("ride_fb_lhp", "sink_fb_lhp", "hard_velo_lhp", "sweep_lhp", "downer_lhp", "gyro_cut_lhp", "chspl_lhp"),
+  "FB Movement (RHP)" = c("ride_fb_rhp", "sink_fb_rhp", "hard_velo_rhp", "soft_fb_rhp", "cut_fb_rhp", "deadzone_fb_rhp"),
+  "FB Movement (LHP)" = c("ride_fb_lhp", "sink_fb_lhp", "hard_velo_lhp", "soft_fb_lhp", "cut_fb_lhp", "deadzone_fb_lhp"),
+  "BB Movement (RHP)" = c("sweep_rhp", "downer_rhp", "gyro_cut_rhp"),
+  "BB Movement (LHP)" = c("sweep_lhp", "downer_lhp", "gyro_cut_lhp"),
+  "BB Type (RHP)" = c("slider_rhp", "cb_rhp", "slurve_rhp"),
+  "BB Type (LHP)" = c("slider_lhp", "cb_lhp", "slurve_lhp"),
+  "OS (RHP/LHP)" = c("chspl_rhp", "chspl_lhp"),
   "Pitch Family (RHP)" = c("fb_rhp", "bb_rhp", "os_rhp"),
   "Pitch Family (LHP)" = c("fb_lhp", "bb_lhp", "os_lhp"),
+  "Location (RHP)" = c("up_rhp", "down_rhp", "in_rhp", "away_rhp", "elevated_rhp", "heart_rhp"),
+  "Location (LHP)" = c("up_lhp", "down_lhp", "in_lhp", "away_lhp", "elevated_lhp", "heart_lhp"),
   "Platoon" = c("vs_rhp", "vs_lhp"),
   "Overall" = c("overall")
 )
@@ -361,6 +678,528 @@ MM_DISPLAY_GROUPS <- list(
 # MATCHUP MATRIX CORE FUNCTIONS
 # ============================================================================
 
+classify_location_zone <- function(plate_loc_side, plate_loc_height, batter_side = "Right") {
+  # Returns a vector of zone labels
+  # Priority: most specific first (heart, elevated), then quadrant (up/down/in/out)
+  
+  # Determine in/out based on batter side
+  # For RHH: negative PlateLocSide = inside, positive = outside
+
+  # For LHH: positive PlateLocSide = inside, negative = outside
+  in_sign <- ifelse(batter_side == "Right", -1, 1)
+  
+  zone <- case_when(
+    # Heart zone: inner 2/3 of zone, middle 2/3 of height
+    abs(plate_loc_side) < 0.55 & plate_loc_height >= 1.83 & plate_loc_height <= 3.17 ~ "Heart",
+    # Elevated: above the zone
+    plate_loc_height > 3.5 ~ "Elevated",
+    # Below zone
+    plate_loc_height < 1.5 ~ "Below",
+    # Up half of zone
+    plate_loc_height >= 2.5 & plate_loc_height <= 3.5 ~ "Up",
+    # Down half of zone
+    plate_loc_height >= 1.5 & plate_loc_height < 2.5 ~ "Down",
+    TRUE ~ "Middle"
+  )
+  
+  # Add in/out dimension for non-heart, non-elevated, non-below pitches
+  in_out <- case_when(
+    zone %in% c("Heart", "Elevated", "Below") ~ zone,
+    (plate_loc_side * in_sign) < -0.28 ~ paste0(zone, "-In"),
+    (plate_loc_side * in_sign) > 0.28 ~ paste0(zone, "-Out"),
+    TRUE ~ zone
+  )
+  
+  in_out
+}
+
+# Simplified zone for the tendency card grid (fewer cells, more samples per cell)
+classify_tendency_zone <- function(plate_loc_side, plate_loc_height, batter_side = "Right") {
+  in_sign <- ifelse(batter_side == "Right", -1, 1)
+  
+  case_when(
+    plate_loc_height > 3.5 ~ "Elevated",
+    plate_loc_height < 1.5 & (plate_loc_side * in_sign) < 0 ~ "GloveDown",
+    plate_loc_height < 1.5 & (plate_loc_side * in_sign) >= 0 ~ "ArmDown",
+    abs(plate_loc_side) < 0.55 & plate_loc_height >= 1.83 & plate_loc_height <= 3.17 ~ "Heart",
+    plate_loc_height >= 2.5 & (plate_loc_side * in_sign) < 0 ~ "UpIn",
+    plate_loc_height >= 2.5 & (plate_loc_side * in_sign) >= 0 ~ "UpAway",
+    plate_loc_height < 2.5 & (plate_loc_side * in_sign) < 0 ~ "DownIn",
+    plate_loc_height < 2.5 & (plate_loc_side * in_sign) >= 0 ~ "DownAway",
+    TRUE ~ "Heart"
+  )
+}
+
+log5_rate <- function(hitter_rate, league_rate) {
+  # Log5 formula: estimates true matchup rate given hitter rate and league baseline
+  # This removes the "dominant pitcher drags everything" problem by normalizing
+  # When used: compute hitter_rate for a cell, league_rate for same cell,
+  # the adjusted rate tells you how this hitter deviates from average for that situation
+  
+  if (is.na(hitter_rate) || is.na(league_rate) || league_rate == 0 || league_rate == 1) {
+    return(hitter_rate)
+  }
+  
+  # Clamp to avoid division issues
+  h <- pmax(0.001, pmin(0.999, hitter_rate))
+  l <- pmax(0.001, pmin(0.999, league_rate))
+  
+  # Log5: p = (h * l) / (h * l + (1-h) * (1-l))
+  # But for single-side (hitter only), we express as odds ratio vs league
+  # Simplified: adjusted = h (we keep raw rate, but express the LOG5 MATCHUP
+  # when overlaying pitcher later)
+  # For the tendency card itself, we store both raw and the log5-ready odds ratio
+  
+  odds_ratio <- (h / (1 - h)) / (l / (1 - l))
+  
+  odds_ratio
+}
+
+log5_matchup_rate <- function(hitter_rate, pitcher_rate, league_rate) {
+  # Full Log5: given hitter rate, pitcher rate, and league rate,
+  # estimate the expected rate in this specific matchup
+  
+  if (is.na(hitter_rate) || is.na(pitcher_rate) || is.na(league_rate)) return(NA_real_)
+  if (league_rate == 0 || league_rate == 1) return(hitter_rate)
+  
+  h <- pmax(0.001, pmin(0.999, hitter_rate))
+  p <- pmax(0.001, pmin(0.999, pitcher_rate))
+  l <- pmax(0.001, pmin(0.999, league_rate))
+  
+  # Log5 formula
+  num <- h * p / l
+  denom <- h * p / l + (1 - h) * (1 - p) / (1 - l)
+  
+  num / denom
+}
+
+# ---------------------------------------------------------------------------
+# TENDENCY CARD CALCULATION
+# ---------------------------------------------------------------------------
+
+# Calculate league-wide rates for Log5 baseline
+calc_league_baseline <- function(pool_data, min_n = 50) {
+  # Pool data should already have indicators added
+  
+  shapes <- c("Ride", "Sink", "Sweep", "Downer", "Cutter", "CH/SPL", "Slider", "Curveball", "Overall")
+  zones <- c("Elevated", "UpIn", "UpAway", "Heart", "DownIn", "DownAway", "GloveDown", "ArmDown", "Overall")
+  counts <- c("first_pitch", "early", "two_strike", "ahead", "behind", "overall")
+  
+  # Overall league rates as fallback
+  n_swings <- sum(pool_data$is_swing, na.rm = TRUE)
+  n_ooz <- sum(pool_data$out_of_zone, na.rm = TRUE)
+  n_bip <- sum(pool_data$PitchCall == "InPlay", na.rm = TRUE)
+  
+  list(
+    whiff_rate = sum(pool_data$is_whiff, na.rm = TRUE) / pmax(1, n_swings),
+    chase_rate = sum(pool_data$chase, na.rm = TRUE) / pmax(1, n_ooz),
+    swing_rate = n_swings / pmax(1, nrow(pool_data)),
+    damage_rate = sum(pool_data$PitchCall == "InPlay" & pool_data$ExitSpeed >= 95, na.rm = TRUE) / pmax(1, n_bip),
+    iz_whiff_rate = sum(pool_data$in_zone_whiff, na.rm = TRUE) / pmax(1, sum(pool_data$z_swing, na.rm = TRUE)),
+    woba = mean(pool_data$woba, na.rm = TRUE),
+    n = nrow(pool_data)
+  )
+}
+
+# Main tendency card builder
+calc_hitter_tendency_card <- function(hitter_name, tm_data, league_baseline, min_n = 10) {
+  
+  h_data <- tm_data %>% filter(Batter == hitter_name)
+  if (nrow(h_data) < 30) return(NULL)
+  
+  batter_side <- detect_batter_handedness(hitter_name, tm_data)
+  
+  # Add movement tag and tendency zone
+  h_data <- h_data %>%
+    mutate(
+      movement_tag = case_when(
+        PitchFamily == "FB" & InducedVertBreak >= 18 ~ "Ride",
+        PitchFamily == "FB" & InducedVertBreak < 9 & abs(HorzBreak) >= 10 ~ "Sink",
+        PitchFamily == "FB" ~ "FB-Other",
+        TaggedPitchType %in% c("Slider", "Sweeper", "SL", "SW") & abs(HorzBreak) >= 14 ~ "Sweep",
+        TaggedPitchType %in% c("Slider", "Sweeper", "SL", "SW") ~ "Slider",
+        TaggedPitchType %in% c("Curveball", "CU", "CB", "KC") ~ "Curveball",
+        TaggedPitchType %in% c("Curveball", "Slider", "Sweeper", "Slurve") & InducedVertBreak <= -6 ~ "Downer",
+        TaggedPitchType %in% c("Cutter", "FC") ~ "Cutter",
+        PitchFamily == "OS" ~ "CH/SPL",
+        TRUE ~ "Other"
+      ),
+      tendency_zone = classify_tendency_zone(PlateLocSide, PlateLocHeight, batter_side),
+      count_state = case_when(
+        Balls == 0 & Strikes == 0 ~ "first_pitch",
+        Strikes < 2 ~ "early",
+        Strikes == 2 ~ "two_strike",
+        Balls > Strikes ~ "behind",
+        Strikes > Balls ~ "ahead",
+        TRUE ~ "early"
+      )
+    )
+  
+  # Define groupings
+  shape_groups <- list(
+    "Ride FB" = c("Ride"),
+    "Sink/Run" = c("Sink", "FB-Other"),
+    "Sweep" = c("Sweep"),
+    "Slider" = c("Slider"),
+    "Curveball" = c("Curveball", "Downer"),
+    "Cutter" = c("Cutter"),
+    "CH/SPL" = c("CH/SPL"),
+    "All FB" = c("Ride", "Sink", "FB-Other", "Cutter"),
+    "All BB" = c("Sweep", "Slider", "Curveball", "Downer"),
+    "All OS" = c("CH/SPL")
+  )
+  
+  zone_groups <- c("Elevated", "UpIn", "UpAway", "Heart", "DownIn", "DownAway", "GloveDown", "ArmDown")
+  count_groups <- c("first_pitch", "early", "two_strike", "ahead", "behind")
+  
+  # Calculate rates for each cell
+  calc_cell_rates <- function(cell_data, baseline) {
+    n <- nrow(cell_data)
+    if (n < min_n) {
+      return(list(
+        n = n, swing_rate = NA, whiff_rate = NA, chase_rate = NA,
+        damage_rate = NA, woba = NA, iz_whiff_rate = NA,
+        swing_or = NA, whiff_or = NA, chase_or = NA, damage_or = NA,
+        label = "", vulnerability = "unknown"
+      ))
+    }
+    
+    n_swings <- sum(cell_data$is_swing, na.rm = TRUE)
+    n_ooz <- sum(cell_data$out_of_zone, na.rm = TRUE)
+    n_iz <- sum(cell_data$in_zone, na.rm = TRUE)
+    n_iz_swing <- sum(cell_data$z_swing, na.rm = TRUE)
+    n_bip <- sum(cell_data$PitchCall == "InPlay", na.rm = TRUE)
+    
+    swing_rate <- n_swings / pmax(1, n)
+    whiff_rate <- sum(cell_data$is_whiff, na.rm = TRUE) / pmax(1, n_swings)
+    chase_rate <- if (n_ooz >= 5) sum(cell_data$chase, na.rm = TRUE) / n_ooz else NA
+    damage_rate <- if (n_bip >= 3) sum(cell_data$PitchCall == "InPlay" & cell_data$ExitSpeed >= 95, na.rm = TRUE) / n_bip else NA
+    iz_whiff_rate <- if (n_iz_swing >= 5) sum(cell_data$in_zone_whiff, na.rm = TRUE) / n_iz_swing else NA
+    woba_val <- if (sum(!is.na(cell_data$woba)) >= 5) mean(cell_data$woba, na.rm = TRUE) else NA
+    
+    # Log5 odds ratios vs league
+    swing_or <- log5_rate(swing_rate, baseline$swing_rate)
+    whiff_or <- log5_rate(whiff_rate, baseline$whiff_rate)
+    chase_or <- if (!is.na(chase_rate)) log5_rate(chase_rate, baseline$chase_rate) else NA
+    damage_or <- if (!is.na(damage_rate)) log5_rate(damage_rate, baseline$damage_rate) else NA
+    
+    # Classify vulnerability
+    vulnerability <- case_when(
+      !is.na(whiff_or) && whiff_or > 1.5 && !is.na(chase_or) && chase_or > 1.3 ~ "high_vuln",
+      !is.na(whiff_or) && whiff_or > 1.3 ~ "vuln_whiff",
+      !is.na(chase_or) && chase_or > 1.4 ~ "vuln_chase",
+      !is.na(damage_or) && damage_or > 1.5 ~ "strength",
+      !is.na(damage_or) && damage_or > 1.2 && !is.na(woba_val) && woba_val > 0.370 ~ "strength",
+      !is.na(whiff_or) && whiff_or < 0.7 && !is.na(damage_or) && damage_or > 1.2 ~ "strength",
+      TRUE ~ "neutral"
+    )
+    
+    list(
+      n = n,
+      swing_rate = round(swing_rate * 100, 1),
+      whiff_rate = round(whiff_rate * 100, 1),
+      chase_rate = if (!is.na(chase_rate)) round(chase_rate * 100, 1) else NA,
+      damage_rate = if (!is.na(damage_rate)) round(damage_rate * 100, 1) else NA,
+      iz_whiff_rate = if (!is.na(iz_whiff_rate)) round(iz_whiff_rate * 100, 1) else NA,
+      woba = if (!is.na(woba_val)) round(woba_val, 3) else NA,
+      swing_or = swing_or,
+      whiff_or = whiff_or,
+      chase_or = chase_or,
+      damage_or = damage_or,
+      vulnerability = vulnerability
+    )
+  }
+  
+  # Build the card: shape x count
+  shape_count_card <- list()
+  for (shape_name in names(shape_groups)) {
+    shape_tags <- shape_groups[[shape_name]]
+    shape_data <- h_data %>% filter(movement_tag %in% shape_tags)
+    
+    shape_count_card[[shape_name]] <- list()
+    
+    # Overall for this shape
+    shape_count_card[[shape_name]][["overall"]] <- calc_cell_rates(shape_data, league_baseline)
+    
+    # By count
+    for (ct in count_groups) {
+      ct_data <- shape_data %>% filter(count_state == ct)
+      shape_count_card[[shape_name]][[ct]] <- calc_cell_rates(ct_data, league_baseline)
+    }
+  }
+  
+  # Build the card: shape x zone
+  shape_zone_card <- list()
+  for (shape_name in names(shape_groups)) {
+    shape_tags <- shape_groups[[shape_name]]
+    shape_data <- h_data %>% filter(movement_tag %in% shape_tags)
+    
+    shape_zone_card[[shape_name]] <- list()
+    for (zone in zone_groups) {
+      zone_data <- shape_data %>% filter(tendency_zone == zone)
+      shape_zone_card[[shape_name]][[zone]] <- calc_cell_rates(zone_data, league_baseline)
+    }
+  }
+  
+  # Build the card: zone x count (pitch-type agnostic)
+  zone_count_card <- list()
+  for (zone in zone_groups) {
+    zone_data <- h_data %>% filter(tendency_zone == zone)
+    zone_count_card[[zone]] <- list()
+    zone_count_card[[zone]][["overall"]] <- calc_cell_rates(zone_data, league_baseline)
+    for (ct in count_groups) {
+      ct_data <- zone_data %>% filter(count_state == ct)
+      zone_count_card[[zone]][[ct]] <- calc_cell_rates(ct_data, league_baseline)
+    }
+  }
+  
+  # Overall stats
+  overall <- calc_cell_rates(h_data, league_baseline)
+  
+  # Identify top vulnerabilities and strengths
+  vuln_cells <- list()
+  strength_cells <- list()
+  
+  for (shape_name in names(shape_count_card)) {
+    for (ct in names(shape_count_card[[shape_name]])) {
+      cell <- shape_count_card[[shape_name]][[ct]]
+      if (cell$n >= min_n && !is.na(cell$vulnerability)) {
+        cell_label <- paste0(shape_name, " / ", ct)
+        if (cell$vulnerability %in% c("high_vuln", "vuln_whiff", "vuln_chase")) {
+          vuln_cells[[cell_label]] <- cell
+        } else if (cell$vulnerability == "strength") {
+          strength_cells[[cell_label]] <- cell
+        }
+      }
+    }
+  }
+  
+  list(
+    name = hitter_name,
+    batter_side = batter_side,
+    n_total = nrow(h_data),
+    overall = overall,
+    shape_count = shape_count_card,
+    shape_zone = shape_zone_card,
+    zone_count = zone_count_card,
+    vulnerabilities = vuln_cells,
+    strengths = strength_cells,
+    shape_groups = shape_groups
+  )
+}
+
+# ---------------------------------------------------------------------------
+# PITCHER OVERLAY — applies pitcher arsenal to hitter tendency card
+# ---------------------------------------------------------------------------
+
+overlay_pitcher_on_tendency <- function(tendency_card, pitcher_name, tm_data, league_baseline) {
+  p_data <- tm_data %>% filter(Pitcher == pitcher_name)
+  if (nrow(p_data) < 30 || is.null(tendency_card)) return(NULL)
+  
+  p_hand <- names(sort(table(p_data$PitcherThrows[!is.na(p_data$PitcherThrows)]), decreasing = TRUE))[1]
+  batter_side <- tendency_card$batter_side
+  
+  # Get pitcher's arsenal with movement tags
+  p_data <- p_data %>%
+    mutate(
+      movement_tag = case_when(
+        classify_pitch_family(TaggedPitchType) == "FB" & InducedVertBreak >= 18 ~ "Ride",
+        classify_pitch_family(TaggedPitchType) == "FB" & InducedVertBreak < 9 & abs(HorzBreak) >= 10 ~ "Sink",
+        classify_pitch_family(TaggedPitchType) == "FB" ~ "FB-Other",
+        TaggedPitchType %in% c("Slider", "Sweeper", "SL", "SW") & abs(HorzBreak) >= 14 ~ "Sweep",
+        TaggedPitchType %in% c("Slider", "Sweeper", "SL", "SW") ~ "Slider",
+        TaggedPitchType %in% c("Curveball", "CU", "CB", "KC") ~ "Curveball",
+        TaggedPitchType %in% c("Curveball", "Slider", "Sweeper", "Slurve") & InducedVertBreak <= -6 ~ "Downer",
+        TaggedPitchType %in% c("Cutter", "FC") ~ "Cutter",
+        classify_pitch_family(TaggedPitchType) == "OS" ~ "CH/SPL",
+        TRUE ~ "Other"
+      ),
+      tendency_zone = classify_tendency_zone(PlateLocSide, PlateLocHeight, batter_side),
+      count_state = case_when(
+        Balls == 0 & Strikes == 0 ~ "first_pitch",
+        Strikes < 2 ~ "early",
+        Strikes == 2 ~ "two_strike",
+        Balls > Strikes ~ "behind",
+        Strikes > Balls ~ "ahead",
+        TRUE ~ "early"
+      )
+    )
+  
+  # Pitcher arsenal profile
+  arsenal <- p_data %>%
+    filter(!is.na(movement_tag), movement_tag != "Other") %>%
+    group_by(movement_tag) %>%
+    summarise(
+      n = n(),
+      pct = n() / nrow(p_data) * 100,
+      avg_velo = mean(RelSpeed, na.rm = TRUE),
+      avg_ivb = mean(InducedVertBreak, na.rm = TRUE),
+      avg_hb = mean(HorzBreak, na.rm = TRUE),
+      # Pitcher's own rates
+      whiff_rate = sum(is_whiff, na.rm = TRUE) / pmax(1, sum(is_swing, na.rm = TRUE)),
+      zone_pct = sum(in_zone, na.rm = TRUE) / n(),
+      .groups = "drop"
+    ) %>%
+    filter(pct >= 3)
+  
+  # Pitcher usage by count
+  usage_by_count <- p_data %>%
+    filter(!is.na(movement_tag), movement_tag != "Other") %>%
+    group_by(count_state, movement_tag) %>%
+    summarise(n = n(), .groups = "drop") %>%
+    group_by(count_state) %>%
+    mutate(pct = n / sum(n) * 100) %>%
+    ungroup()
+  
+  # Pitcher location tendencies by pitch shape
+  location_by_shape <- p_data %>%
+    filter(!is.na(movement_tag), movement_tag != "Other", !is.na(tendency_zone)) %>%
+    group_by(movement_tag, tendency_zone) %>%
+    summarise(n = n(), .groups = "drop") %>%
+    group_by(movement_tag) %>%
+    mutate(pct = n / sum(n) * 100) %>%
+    ungroup()
+  
+  # Match pitcher pitches to hitter tendency card
+  # For each pitch the pitcher throws, find the hitter's tendency in that shape x zone x count
+  shape_groups <- tendency_card$shape_groups
+  
+  matchup_recommendations <- list()
+  
+  count_labels <- c("first_pitch" = "First Pitch", "early" = "Early Count",
+                    "two_strike" = "2 Strikes", "ahead" = "Ahead", "behind" = "Behind")
+  
+  for (ct in c("first_pitch", "early", "two_strike")) {
+    ct_usage <- usage_by_count %>% filter(count_state == ct)
+    if (nrow(ct_usage) == 0) next
+    
+    recs <- list()
+    for (i in seq_len(nrow(ct_usage))) {
+      pitch_tag <- ct_usage$movement_tag[i]
+      pitch_pct <- ct_usage$pct[i]
+      
+      # Find which shape group this pitch belongs to
+      matching_group <- NULL
+      for (sg_name in names(shape_groups)) {
+        if (pitch_tag %in% shape_groups[[sg_name]]) {
+          matching_group <- sg_name
+          break
+        }
+      }
+      if (is.null(matching_group)) next
+      
+      # Get hitter's rates for this shape in this count
+      h_cell <- tendency_card$shape_count[[matching_group]][[ct]]
+      if (is.null(h_cell) || h_cell$n < 5) {
+        h_cell <- tendency_card$shape_count[[matching_group]][["overall"]]
+      }
+      
+      # Get pitcher's whiff rate for this pitch
+      p_pitch <- arsenal %>% filter(movement_tag == pitch_tag)
+      p_whiff <- if (nrow(p_pitch) > 0) p_pitch$whiff_rate[1] else NA
+      
+      # Log5 matchup whiff rate
+      matchup_whiff <- log5_matchup_rate(
+        h_cell$whiff_rate / 100,
+        if (!is.na(p_whiff)) p_whiff else league_baseline$whiff_rate,
+        league_baseline$whiff_rate
+      )
+      
+      # Best location for this pitch against this hitter
+      loc_tend <- location_by_shape %>% filter(movement_tag == pitch_tag)
+      best_zone <- NULL
+      if (nrow(loc_tend) > 0) {
+        # Find zones where pitcher locates AND hitter is vulnerable
+        for (j in seq_len(nrow(loc_tend))) {
+          zone <- loc_tend$tendency_zone[j]
+          zone_pct <- loc_tend$pct[j]
+          h_zone_cell <- tendency_card$shape_zone[[matching_group]][[zone]]
+          if (!is.null(h_zone_cell) && h_zone_cell$n >= 5) {
+            if (h_zone_cell$vulnerability %in% c("high_vuln", "vuln_whiff", "vuln_chase") && zone_pct >= 10) {
+              best_zone <- list(zone = zone, pct = zone_pct, h_vuln = h_zone_cell$vulnerability,
+                               h_whiff = h_zone_cell$whiff_rate, h_chase = h_zone_cell$chase_rate)
+              break
+            }
+          }
+        }
+      }
+      
+      recs[[pitch_tag]] <- list(
+        pitch = pitch_tag,
+        shape_group = matching_group,
+        usage_pct = pitch_pct,
+        h_whiff = h_cell$whiff_rate,
+        h_chase = h_cell$chase_rate,
+        h_damage = h_cell$damage_rate,
+        h_woba = h_cell$woba,
+        h_vuln = h_cell$vulnerability,
+        matchup_whiff = if (!is.na(matchup_whiff)) round(matchup_whiff * 100, 1) else NA,
+        best_zone = best_zone
+      )
+    }
+    
+    matchup_recommendations[[ct]] <- recs
+  }
+  
+  list(
+    pitcher_name = pitcher_name,
+    pitcher_hand = p_hand,
+    hitter_name = tendency_card$name,
+    arsenal = arsenal,
+    usage_by_count = usage_by_count,
+    location_by_shape = location_by_shape,
+    recommendations = matchup_recommendations
+  )
+}
+
+                
+mm_calc_count_rv <- function(player_data, rv_col, count_type) {
+
+  if (nrow(player_data) == 0) return(list(rv100 = NA_real_, n = 0L))
+  
+  filtered <- switch(count_type,
+    "0-0" = player_data %>% filter(Balls == 0, Strikes == 0),
+    "hitters" = player_data %>% filter(Balls > Strikes),
+    "pitchers" = player_data %>% filter(Strikes > Balls),
+    "2k" = player_data %>% filter(Strikes == 2),
+    player_data
+  )
+  
+  rv <- filtered[[rv_col]][!is.na(filtered[[rv_col]])]
+  n <- length(rv)
+  if (n == 0) return(list(rv100 = NA_real_, n = 0L))
+  list(rv100 = 100 * mean(rv), n = n)
+}
+
+# Calculate all count splits for a player, optionally filtered by pitcher hand
+mm_calc_count_splits <- function(player_data, rv_col, pitcher_hand = NULL, is_pitcher = FALSE) {
+  if (nrow(player_data) == 0) return(list())
+  
+  filtered <- player_data
+  if (!is.null(pitcher_hand)) {
+    if (is_pitcher) {
+      batter_side <- ifelse(pitcher_hand == "Right", "Right", "Left")
+      if ("BatterSide" %in% names(filtered)) {
+        filtered <- filtered %>% filter(BatterSide == batter_side)
+      }
+    } else {
+      filtered <- filtered %>% filter(PitcherThrows == pitcher_hand)
+    }
+  }
+  
+  count_types <- c("0-0", "hitters", "pitchers", "2k")
+  count_labels <- c("0-0" = "0-0", "hitters" = "Hitter Ct", "pitchers" = "Pitcher Ct", "2k" = "2 Strikes")
+  
+  results <- lapply(count_types, function(ct) {
+    res <- mm_calc_count_rv(filtered, rv_col, ct)
+    res$name <- count_labels[[ct]]
+    res$count_type <- ct
+    res
+  })
+  names(results) <- count_types
+  results
+}
+  
 mm_fast_filter <- function(df, config, is_pitcher = FALSE) {
   if (nrow(df) == 0) return(df)
   mask <- rep(TRUE, nrow(df))
@@ -833,6 +1672,20 @@ get_last_n_games <- function(df, batter, n = 15) {
     dplyr::distinct(Date, .keep_all = TRUE) %>%
     dplyr::slice_head(n = n) %>%
     dplyr::pull(Date)
+}
+
+
+# Helper function to classify pitches into detailed categories for heatmaps
+classify_detailed_pitch <- function(pitch_type) {
+  case_when(
+    pitch_type %in% c("Fastball", "Four-Seam", "FourSeamFastBall", "FF", "FB") ~ "4S",
+    pitch_type %in% c("TwoSeamFastBall", "Sinker", "SI", "FT") ~ "2S/Si",
+    pitch_type %in% c("Slider", "Sweeper", "SL", "SW") ~ "SL/SW",
+    pitch_type %in% c("Curveball", "Slurve", "CU", "CB", "KC", "SV") ~ "CB",
+    pitch_type %in% c("Changeup", "ChangeUp", "Splitter", "CH", "FS", "SP") ~ "CH/Spl",
+    pitch_type %in% c("Cutter", "FC") ~ "SL/SW",  # Group cutters with sliders
+    TRUE ~ "Other"
+  )
 }
 
 # ============================================================================
@@ -1987,6 +2840,48 @@ app_css <- HTML("
     background: #006F71 !important; color: white !important;
     border-color: #006F71;
   }
+.mm-main-tabs > .nav-pills > li.active > a {
+    background: #006F71 !important; color: white !important;
+    border-color: #006F71;
+  }
+
+  /* Tendency Cards Tab */
+  .tc-controls { background: white; border-radius: 12px; padding: 20px; margin-bottom: 15px;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.05); border: 1px solid rgba(0,111,113,.2); }
+  .tc-card { background: white; border-radius: 12px; padding: 16px; margin-bottom: 15px;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.05); border: 1px solid rgba(0,111,113,.2); }
+  .tc-card h3 { color: #006F71; font-weight: 800; font-size: 1.1rem;
+    border-bottom: 2px solid #006F71; padding-bottom: 8px; margin: 0 0 12px; }
+  .tc-grid-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+  .tc-grid-table th { background: #006F71; color: white; padding: 6px 8px; text-align: center;
+    font-weight: 600; font-size: 10px; }
+  .tc-grid-table td { padding: 5px 6px; text-align: center; border: 1px solid #e0e0e0; font-size: 11px; }
+  .tc-grid-table tr:nth-child(even) { background: #f9f9f9; }
+  .tc-grid-table .row-label { text-align: left; font-weight: 700; background: #f0f0f0;
+    color: #333; min-width: 70px; }
+  .tc-vuln { background: #FFCDD2 !important; color: #B71C1C; font-weight: 700; }
+  .tc-high-vuln { background: #EF9A9A !important; color: #B71C1C; font-weight: 800; }
+  .tc-strength { background: #C8E6C9 !important; color: #1B5E20; font-weight: 700; }
+  .tc-neutral { background: #FFF9C4; color: #F57F17; }
+  .tc-empty { background: #f5f5f5; color: #bbb; }
+  .tc-badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 10px;
+    font-weight: 600; margin: 1px; }
+  .tc-badge-vuln { background: #FFCDD2; color: #C62828; }
+  .tc-badge-strength { background: #C8E6C9; color: #2E7D32; }
+  .tc-badge-neutral { background: #E0E0E0; color: #666; }
+  .tc-rec-card { background: #f8fafa; border-radius: 8px; padding: 10px 14px; margin-bottom: 8px;
+    border-left: 4px solid #006F71; }
+  .tc-rec-card.rec-good { border-left-color: #2E7D32; }
+  .tc-rec-card.rec-bad { border-left-color: #C62828; }
+  .tc-rec-card.rec-neutral { border-left-color: #F57F17; }
+  .tc-rec-pitch { font-weight: 700; font-size: 13px; }
+  .tc-rec-detail { font-size: 11px; color: #555; margin-top: 3px; }
+  .tc-summary-box { background: linear-gradient(135deg, #006F71, #004d4e); color: white;
+    border-radius: 10px; padding: 14px 18px; margin-bottom: 15px; }
+  .tc-summary-box h4 { margin: 0 0 8px; font-size: 15px; }
+  .tc-summary-box p { margin: 4px 0; font-size: 12px; opacity: 0.95; }
+  .tc-overlay-header { background: linear-gradient(135deg, #37474F, #546E7A); color: white;
+    padding: 10px 16px; border-radius: 8px; margin-bottom: 12px; }
 ")
 
 # ============================================================================
@@ -2051,6 +2946,16 @@ app_ui <- fluidPage(
   tags$head(tags$style(app_css)),
   div(class = "app-header",
       div(div(class = "header-title", "Coastal Carolina Baseball Analytics"), div(class = "header-subtitle", "Opposing Hitter Scouting & Matchup Analysis"))),
+
+  div(style = "padding: 8px 20px; background: #f8f9fa; border-bottom: 1px solid #ddd; display: flex; align-items: center; gap: 15px;",
+      tags$label(style = "font-weight: 700; color: #006F71; margin: 0;", "Data Source:"),
+      checkboxGroupInput("data_source", NULL,
+                         choices = c("2025" = "2025", "2026" = "2026"),
+                         selected = "2026", inline = TRUE),
+      actionButton("refresh_data", "Refresh", icon = icon("refresh"),
+                   class = "btn-info btn-sm"),
+      textOutput("data_source_info")
+  ),
   
   div(class = "mm-main-tabs",
     tabsetPanel(id = "main_tabs", type = "pills",
@@ -2072,6 +2977,167 @@ app_ui <- fluidPage(
             column(9, uiOutput("hitter_detail_panel")))
         )
       ),
+
+      # ====== TAB 3: PITCHER-HITTER MATCHUPS ======
+      tabPanel("Pitcher-Hitter Matchups",
+        div(style = "padding: 15px; max-width: 1400px; margin: 0 auto;",
+          div(class = "mm-controls-card",
+            fluidRow(
+              column(3,
+                tags$label("Mode"),
+                radioButtons("phm_mode", NULL, 
+                  choices = c("One Hitter vs Pitchers" = "one_hitter", "One Pitcher vs Hitters" = "one_pitcher"),
+                  selected = "one_hitter", inline = TRUE)
+              ),
+              column(4,
+                conditionalPanel("input.phm_mode == 'one_hitter'",
+                  tags$label("Select Hitter"),
+                  selectizeInput("phm_hitter", NULL, choices = NULL, multiple = FALSE,
+                    options = list(placeholder = "Select one hitter..."))
+                ),
+                conditionalPanel("input.phm_mode == 'one_pitcher'",
+                  tags$label("Select Hitters"),
+                  selectizeInput("phm_hitters_multi", NULL, choices = NULL, multiple = TRUE,
+                    options = list(placeholder = "Select hitters...", maxItems = 15))
+                )
+              ),
+              column(4,
+                conditionalPanel("input.phm_mode == 'one_hitter'",
+                  tags$label("Select Pitchers"),
+                  selectizeInput("phm_pitchers_multi", NULL, choices = NULL, multiple = TRUE,
+                    options = list(placeholder = "Select pitchers...", maxItems = 15))
+                ),
+                conditionalPanel("input.phm_mode == 'one_pitcher'",
+                  tags$label("Select Pitcher"),
+                  selectizeInput("phm_pitcher", NULL, choices = NULL, multiple = FALSE,
+                    options = list(placeholder = "Select one pitcher..."))
+                )
+              ),
+              column(1,
+                div(style = "margin-top: 22px;",
+                  actionButton("phm_analyze", "Analyze", class = "btn-mm-analyze"))
+              )
+            )
+          ),
+          
+          div(class = "mm-status-bar", textOutput("phm_status")),
+          
+          conditionalPanel("input.phm_analyze > 0",
+            div(class = "mm-results-card",
+              h3(textOutput("phm_results_title")),
+              div(style = "margin-top: 16px;", gt_output("phm_arsenal_table")),
+              hr(),
+              div(style = "margin-top: 16px;", gt_output("phm_breakdown_table"))
+            )
+          ),
+          
+          conditionalPanel("input.phm_analyze == 0",
+            div(class = "mm-empty-state",
+              div(class = "icon", icon("baseball")),
+              p("Select a hitter and pitchers (or vice versa), then click Analyze"),
+              p(style = "font-size: 12px; color: #999;", 
+                "This tab identifies each pitcher's arsenal and shows how the hitter performs against each specific pitch shape")
+            )
+          )
+        )
+      ),
+
+      tabPanel("Tendency Cards",
+  div(style = "padding: 15px; max-width: 1400px; margin: 0 auto;",
+    
+    # Controls
+    div(class = "tc-controls",
+      fluidRow(
+        column(4,
+          tags$label(style = "font-weight: 700; color: #006F71;", "Select Hitter"),
+          selectizeInput("tc_hitter", NULL, choices = NULL, multiple = FALSE,
+            options = list(placeholder = "Search hitter..."))
+        ),
+        column(3,
+          tags$label(style = "font-weight: 700; color: #006F71;", "Overlay Pitcher (Optional)"),
+          selectizeInput("tc_pitcher", NULL, choices = NULL, multiple = FALSE,
+            options = list(placeholder = "Select pitcher to overlay..."))
+        ),
+        column(2,
+          tags$label(style = "font-weight: 700; color: #006F71;", "Primary Metric"),
+          selectInput("tc_metric", NULL,
+            choices = c("Whiff%" = "whiff_rate", "Chase%" = "chase_rate",
+                        "Damage%" = "damage_rate", "wOBA" = "woba",
+                        "Swing%" = "swing_rate"),
+            selected = "whiff_rate")
+        ),
+        column(1,
+          div(style = "margin-top: 22px;",
+            actionButton("tc_build", "Build Card", class = "btn-mm-analyze"))
+        ),
+        column(2,
+          div(style = "margin-top: 22px;",
+            downloadButton("tc_download_pdf", "Download PDF", class = "btn-mm-download"))
+        )
+      )
+    ),
+    
+    # Results
+    conditionalPanel("input.tc_build > 0",
+      
+      # Summary box
+      uiOutput("tc_summary"),
+      
+      fluidRow(
+        # Left column: Shape x Count grid
+        column(6,
+          div(class = "tc-card",
+            h3("Pitch Shape × Count Tendencies"),
+            div(style = "overflow-x: auto;", uiOutput("tc_shape_count_grid"))
+          )
+        ),
+        # Right column: Shape x Zone grid
+        column(6,
+          div(class = "tc-card",
+            h3("Pitch Shape × Zone Tendencies"),
+            div(style = "overflow-x: auto;", uiOutput("tc_shape_zone_grid"))
+          )
+        )
+      ),
+      
+      fluidRow(
+        # Zone x Count grid
+        column(6,
+          div(class = "tc-card",
+            h3("Zone × Count (All Pitch Types)"),
+            div(style = "overflow-x: auto;", uiOutput("tc_zone_count_grid"))
+          )
+        ),
+        # Vulnerabilities & Strengths summary
+        column(6,
+          div(class = "tc-card",
+            h3("Key Vulnerabilities & Strengths"),
+            uiOutput("tc_vuln_summary")
+          )
+        )
+      ),
+      
+      # Pitcher overlay section (conditional)
+      conditionalPanel("input.tc_pitcher != ''",
+        div(class = "tc-card",
+          h3(textOutput("tc_overlay_title")),
+          uiOutput("tc_pitcher_overlay")
+        )
+      )
+    ),
+    
+    # Empty state
+    conditionalPanel("input.tc_build == 0",
+      div(class = "mm-empty-state",
+        div(class = "icon", icon("id-card")),
+        p("Select a hitter and click Build Card to generate their tendency profile"),
+        p(style = "font-size: 12px; color: #999;",
+          "Tendency cards show hitter rates by pitch shape, zone, and count — Log5 adjusted against league baselines. ",
+          "Optionally overlay a pitcher's arsenal to get targeted sequence recommendations.")
+      )
+    )
+  )
+),
       
       # ====== TAB 2: MATCHUP MATRICES ======
       tabPanel("Matchup Matrices",
@@ -2083,12 +3149,12 @@ app_ui <- fluidPage(
               column(4,
                 tags$label("Hitters"),
                 selectizeInput("mm_hitters", NULL, choices = NULL, multiple = TRUE,
-                  options = list(placeholder = "Select hitters...", maxItems = 12))
+                  options = list(placeholder = "Select hitters...", maxItems = 15))
               ),
               column(4,
                 tags$label("Pitchers"),
                 selectizeInput("mm_pitchers", NULL, choices = NULL, multiple = TRUE,
-                  options = list(placeholder = "Select pitchers...", maxItems = 8))
+                  options = list(placeholder = "Select pitchers...", maxItems = 15))
               ),
               column(2,
                 tags$label("View"),
@@ -2131,24 +3197,30 @@ app_ui <- fluidPage(
               div(style = "margin-top: 12px;",
                 textInput("mm_pdf_title", "Report Title", value = "Matchup Matrix Report", width = "100%")
               ),
-              div(style = "margin-top: 8px;",
-                textAreaInput("mm_pdf_best_matchups", "Best Matchups",
-                  placeholder = "e.g., Smith vs Johnson - favorable on breaking balls",
-                  rows = 2, width = "100%")
-              ),
-              div(style = "margin-top: 8px;",
-                textAreaInput("mm_pdf_worst_matchups", "Worst Matchups",
-                  placeholder = "e.g., Davis vs Miller - struggles with high velo",
-                  rows = 2, width = "100%")
-              ),
-              div(style = "margin-top: 8px;",
-                textAreaInput("mm_pdf_notes", "Additional Notes",
-                  placeholder = "Game notes, scouting observations, etc.",
-                  rows = 3, width = "100%")
+              fluidRow(
+                column(3,
+                  textAreaInput("mm_pdf_best_matchups", "Good Matchups for Coastal",
+                    placeholder = "e.g., Smith vs Johnson - favorable on breaking balls",
+                    rows = 4, width = "100%")
+                ),
+                column(3,
+                  textAreaInput("mm_pdf_worst_matchups", "Bad Matchups for Coastal",
+                    placeholder = "e.g., Davis vs Miller - struggles with high velo",
+                    rows = 4, width = "100%")
+                ),
+                column(3,
+                  textAreaInput("mm_pdf_avail_rhp", "Available RHP",
+                    placeholder = "e.g., Horn, Doran, Appelman, Parker",
+                    rows = 4, width = "100%")
+                ),
+                column(3,
+                  textAreaInput("mm_pdf_avail_lhp", "Available LHP",
+                    placeholder = "e.g., Richardson, Bosch, Winer, Karr",
+                    rows = 4, width = "100%")
+                )
               )
             )
-          ),
-          
+            ),
           # Status Bar
           div(class = "mm-status-bar", textOutput("mm_status")),
           
@@ -2192,12 +3264,57 @@ ui <- fluidPage(
 
 server <- function(input, output, session) {
   logged_in <- reactiveVal(FALSE)
+
+  data_2026_rv <- reactiveVal(data_2026)
   
   output$page <- renderUI({
     if (logged_in()) {
       app_ui
     } else {
       login_ui
+    }
+  })
+
+
+  active_data <- reactive({
+    src <- input$data_source
+    if (is.null(src) || length(src) == 0) return(tm_data)
+    if (all(c("2025", "2026") %in% src)) {
+      bind_rows(tm_data %>% mutate(Date = as.Date(Date),
+                                   Time = as.character(Time),
+                                   UTCDate = as.Date(UTCDate),
+                                   UTCTime = as.character(UTCTime),
+                                   LocalDateTime = as.character(LocalDateTime),
+                                   UTCDateTime = as.character(UTCDateTime),
+                                   Tilt = as.character(Tilt),
+                                   HomeTeamForeignID = as.character(HomeTeamForeignID),
+                                   AwayTeamForeignID = as.character(AwayTeamForeignID),
+                                   PositionAt110X = as.character(PositionAt110X),
+                                   PositionAt110Y = as.character(PositionAt110Y),
+                                   PositionAt110Z = as.character(PositionAt110Z),
+                                   across(starts_with(c("PitchTrajectory", "HitTrajectory", "HitSpinAxis", 
+                                                        "CatchPosition", "ThrowPosition", "BasePosition",
+                                                       "ThrowTrajectory")), as.numeric)),
+                data_2026 %>% mutate(Date = as.Date(Date),
+                                   Time = as.character(Time),
+                                  UTCDate = as.Date(UTCDate),
+                                  UTCTime = as.character(UTCTime),
+                                  LocalDateTime = as.character(LocalDateTime),
+                                  UTCDateTime = as.character(UTCDateTime),
+                                  Tilt = as.character(Tilt),
+                                  HomeTeamForeignID = as.character(HomeTeamForeignID),
+                                  AwayTeamForeignID = as.character(AwayTeamForeignID),
+                                  PositionAt110X = as.character(PositionAt110X),
+                                  PositionAt110Y = as.character(PositionAt110Y),
+                                  PositionAt110Z = as.character(PositionAt110Z),
+                                  across(starts_with(c("PitchTrajectory", "HitTrajectory", "HitSpinAxis", 
+                                                        "CatchPosition", "ThrowPosition", "BasePosition",
+                                                       "ThrowTrajectory")), as.numeric)) 
+                        %>% distinct())
+    } else if ("2026" %in% src) {
+      data_2026_rv()
+    } else {
+      tm_data
     }
   })
   
@@ -2209,8 +3326,30 @@ server <- function(input, output, session) {
       output$wrong_pass <- renderText("Incorrect password, please try again.")
     }
   })
+
+output$data_source_info <- renderText({
+  src <- input$data_source
+  if (is.null(src) || length(src) == 0) return("No data source selected")
+  d <- active_data()
+  label <- paste(src, collapse = " + ")
+  paste0(label, ": ", nrow(d), " rows | ", length(unique(d$Batter)), " hitters | ", length(unique(d$Pitcher)), " pitchers")
+})
   
-  scout_data <- reactiveVal(list())
+# Update dropdowns when data source changes
+observeEvent(input$data_source, {
+  d <- active_data()
+  updateSelectizeInput(session, "scout_hitters", choices = sort(unique(d$Batter)), server = TRUE)
+  updateSelectizeInput(session, "mm_hitters", choices = sort(unique(d$Batter)), server = TRUE)
+  updateSelectizeInput(session, "mm_pitchers", choices = sort(unique(d$Pitcher)), server = TRUE)
+  updateSelectizeInput(session, "tc_hitter", choices = sort(unique(d$Batter)), server = TRUE)
+  updateSelectizeInput(session, "tc_pitcher", choices = c("", sort(unique(d$Pitcher))), server = TRUE)
+  scout_data(list())
+  selected_hitter(NULL)
+}, ignoreInit = TRUE)
+
+  
+  
+scout_data <- reactiveVal(list())
   selected_hitter <- reactiveVal(NULL)
   
   # Initialize all selectize inputs AFTER login
@@ -2219,6 +3358,8 @@ server <- function(input, output, session) {
       updateSelectizeInput(session, "scout_hitters", choices = all_hitters, server = TRUE)
       updateSelectizeInput(session, "mm_hitters", choices = all_hitters, server = TRUE)
       updateSelectizeInput(session, "mm_pitchers", choices = all_pitchers, server = TRUE)
+      updateSelectizeInput(session, "tc_hitter", choices = all_hitters, server = TRUE)
+      updateSelectizeInput(session, "tc_pitcher", choices = c("", all_pitchers), server = TRUE)
     }
   }, ignoreInit = TRUE)
   
@@ -2227,13 +3368,40 @@ server <- function(input, output, session) {
     current_data <- scout_data()
     for (h in hitters) {
       if (is.null(current_data[[h]])) {
-        profile <- calculate_hitter_profile(h, tm_data, gm)
-        if (!is.null(profile)) current_data[[h]] <- list(profile = profile, lhp_plan = "", rhp_plan = "", overall_notes = "", pitcher_matchup_notes = "")
+        profile <- tryCatch(
+          calculate_hitter_profile(h, active_data(), gm),
+          error = function(e) {
+            cat("ERROR calculating profile for", h, ":", e$message, "\n")
+            NULL
+          }
+        )
+        if (!is.null(profile)) {
+          current_data[[h]] <- list(
+            profile = profile, lhp_plan = "", rhp_plan = "",
+            overall_notes = "", pitcher_matchup_notes = ""
+          )
+        } else {
+          cat("Skipping", h, "- insufficient data\n")
+        }
       }
     }
     current_data <- current_data[names(current_data) %in% hitters]
     scout_data(current_data)
-    if (is.null(selected_hitter()) && length(hitters) > 0) selected_hitter(hitters[1])
+    
+    # Notify user if some hitters were dropped
+    n_selected <- length(hitters)
+    n_loaded <- length(current_data)
+    if (n_loaded < n_selected) {
+      showNotification(
+        paste0(n_loaded, " of ", n_selected, " hitters loaded (",
+               n_selected - n_loaded, " had insufficient data)"),
+        type = "warning", duration = 5
+      )
+    }
+    
+    if (is.null(selected_hitter()) && length(names(current_data)) > 0) {
+      selected_hitter(names(current_data)[1])
+    }
   })
   
   observeEvent(input$select_hitter, { selected_hitter(input$select_hitter) })
@@ -2262,7 +3430,7 @@ server <- function(input, output, session) {
     h_data <- data[[h_name]]
     profile <- h_data$profile
     hitter_id <- gsub("[^A-Za-z0-9]", "_", h_name)
-    h_raw <- tm_data %>% filter(Batter == h_name)
+    h_raw <- active_data() %>% filter(Batter == h_name)
     cs <- list(fp = calc_count_stats(h_raw %>% filter(count_cat == "First Pitch")),
                ahead = calc_count_stats(h_raw %>% filter(count_cat == "Ahead")),
                behind = calc_count_stats(h_raw %>% filter(count_cat == "Behind")),
@@ -2270,11 +3438,11 @@ server <- function(input, output, session) {
                early = calc_count_stats(h_raw %>% filter(Strikes < 2)))
     
     # Calculate LHP/RHP splits
-    rhp_profile <- calculate_hitter_profile(h_name, tm_data, gm, "Right")
-    lhp_profile <- calculate_hitter_profile(h_name, tm_data, gm, "Left")
+    rhp_profile <- calculate_hitter_profile(h_name, active_data(), gm, "Right")
+    lhp_profile <- calculate_hitter_profile(h_name, active_data(), gm, "Left")
     
     # Last 15 games stats
-    last15_dates <- get_last_n_games(tm_data, h_name, 15)
+    last15_dates <- get_last_n_games(active_data(), h_name, 15)
     last15_data <- h_raw %>% filter(Date %in% last15_dates)
     last15_stats <- calc_count_stats(last15_data)
     
@@ -2601,7 +3769,7 @@ server <- function(input, output, session) {
     h_name <- selected_hitter()
     if (is.null(h_name)) return()
     hitter_id <- gsub("[^A-Za-z0-9]", "_", h_name)
-    h_raw <- tm_data %>% filter(Batter == h_name)
+    h_raw <- active_data() %>% filter(Batter == h_name)
     
     # Spray charts by pitcher hand
     output[[paste0("spray_all_", hitter_id)]] <- renderPlot({ create_spray_chart(h_raw, "Overall", "all") }, bg = "transparent")
@@ -2649,16 +3817,16 @@ server <- function(input, output, session) {
     }, bg = "transparent")
     
     # Hit/Out charts by hand
-    output[[paste0("ho_rhp_hits_", hitter_id)]] <- renderPlot({ create_hit_out_chart(tm_data, h_name, "rhp_hits") }, bg = "transparent")
-    output[[paste0("ho_rhp_outs_", hitter_id)]] <- renderPlot({ create_hit_out_chart(tm_data, h_name, "rhp_outs") }, bg = "transparent")
-    output[[paste0("ho_lhp_hits_", hitter_id)]] <- renderPlot({ create_hit_out_chart(tm_data, h_name, "lhp_hits") }, bg = "transparent")
-    output[[paste0("ho_lhp_outs_", hitter_id)]] <- renderPlot({ create_hit_out_chart(tm_data, h_name, "lhp_outs") }, bg = "transparent")
+    output[[paste0("ho_rhp_hits_", hitter_id)]] <- renderPlot({ create_hit_out_chart(active_data(), h_name, "rhp_hits") }, bg = "transparent")
+    output[[paste0("ho_rhp_outs_", hitter_id)]] <- renderPlot({ create_hit_out_chart(active_data(), h_name, "rhp_outs") }, bg = "transparent")
+    output[[paste0("ho_lhp_hits_", hitter_id)]] <- renderPlot({ create_hit_out_chart(active_data(), h_name, "lhp_hits") }, bg = "transparent")
+    output[[paste0("ho_lhp_outs_", hitter_id)]] <- renderPlot({ create_hit_out_chart(active_data(), h_name, "lhp_outs") }, bg = "transparent")
     
     # Hit/Out charts by count (0-1 strikes and 2 strikes)
-    output[[paste0("ho_early_hits_", hitter_id)]] <- renderPlot({ create_hit_out_chart(tm_data, h_name, "early_hits") }, bg = "transparent")
-    output[[paste0("ho_early_outs_", hitter_id)]] <- renderPlot({ create_hit_out_chart(tm_data, h_name, "early_outs") }, bg = "transparent")
-    output[[paste0("ho_2k_hits_", hitter_id)]] <- renderPlot({ create_hit_out_chart(tm_data, h_name, "2k_hits") }, bg = "transparent")
-    output[[paste0("ho_2k_outs_", hitter_id)]] <- renderPlot({ create_hit_out_chart(tm_data, h_name, "2k_outs") }, bg = "transparent")
+    output[[paste0("ho_early_hits_", hitter_id)]] <- renderPlot({ create_hit_out_chart(active_data(), h_name, "early_hits") }, bg = "transparent")
+    output[[paste0("ho_early_outs_", hitter_id)]] <- renderPlot({ create_hit_out_chart(active_data(), h_name, "early_outs") }, bg = "transparent")
+    output[[paste0("ho_2k_hits_", hitter_id)]] <- renderPlot({ create_hit_out_chart(active_data(), h_name, "2k_hits") }, bg = "transparent")
+    output[[paste0("ho_2k_outs_", hitter_id)]] <- renderPlot({ create_hit_out_chart(active_data(), h_name, "2k_outs") }, bg = "transparent")
     
     # SEC Percentile Chart
     output[[paste0("pct_sec_", hitter_id)]] <- renderPlot({
@@ -2787,7 +3955,7 @@ server <- function(input, output, session) {
     # ============================================================================
     
     # Update date range based on batter's data
-    date_range <- get_batter_date_range(h_name, tm_data)
+    date_range <- get_batter_date_range(h_name, active_data())
     updateDateRangeInput(session, paste0("trend_dates_", hitter_id),
                          start = max(date_range$min, Sys.Date() - 180),
                          end = date_range$max,
@@ -2808,7 +3976,7 @@ server <- function(input, output, session) {
       start_date <- if (!is.null(date_range[1])) date_range[1] else NULL
       end_date <- if (!is.null(date_range[2])) date_range[2] else NULL
       
-      create_trend_chart(h_name, tm_data, selected_stats, start_date, end_date, rolling_games = 5)
+      create_trend_chart(h_name, active_data(), selected_stats, start_date, end_date, rolling_games = 5)
     }, bg = "transparent")
     
     # Select/Deselect all stats buttons
@@ -2850,7 +4018,7 @@ server <- function(input, output, session) {
   output$mm_status <- renderText({
     n_h <- length(input$mm_hitters)
     n_p <- length(input$mm_pitchers)
-    paste0(format(nrow(tm_data), big.mark = ","), " pitches | ", 
+    paste0(format(nrow(active_data()), big.mark = ","), " pitches | ", 
            n_h, " hitter", ifelse(n_h != 1, "s", ""), " selected | ",
            n_p, " pitcher", ifelse(n_p != 1, "s", ""), " selected")
   })
@@ -2867,11 +4035,11 @@ server <- function(input, output, session) {
   
   # Calculate all data on analyze
   mm_calc_data <- eventReactive(input$mm_analyze, {
-    req(tm_data)
+    req(active_data())
     
     hitter_list <- if (length(input$mm_hitters) > 0) {
       lapply(input$mm_hitters, function(h) {
-        hd <- tm_data[tm_data$Batter == h, , drop = FALSE]
+        hd <- active_data()[active_data()$Batter == h, , drop = FALSE]
         if (nrow(hd) == 0) return(NULL)
         list(name = h, splits = mm_calc_all_splits(hd, "mean_DRE_bat", is_pitcher = FALSE), data = hd, n = nrow(hd))
       })
@@ -2881,7 +4049,7 @@ server <- function(input, output, session) {
     
     pitcher_list <- if (length(input$mm_pitchers) > 0) {
       lapply(input$mm_pitchers, function(p) {
-        pd <- tm_data[tm_data$Pitcher == p, , drop = FALSE]
+        pd <- active_data()[active_data()$Pitcher == p, , drop = FALSE]
         if (nrow(pd) == 0) return(NULL)
         list(name = p, splits = mm_calc_all_splits(pd, "mean_DRE_pit", is_pitcher = TRUE), data = pd, n = nrow(pd))
       })
@@ -2975,19 +4143,20 @@ server <- function(input, output, session) {
         tab_style(style = cell_text(weight = "bold"), locations = cells_body(columns = "Hitter"))
     }
     
-    # Hitter Profiles
-    else if (input$mm_view_mode == "hitter_profiles") {
+   else if (input$mm_view_mode == "hitter_profiles") {
       req(cd$hitters)
       display_splits <- mm_get_display_splits()
+      req(length(display_splits) > 0)
       
       rows <- lapply(cd$hitters, function(h) {
-        vals <- sapply(display_splits, function(s) round(h$splits[[s]]$rv100, 2))
-        confs <- sapply(display_splits, function(s) h$splits[[s]]$weight)
-        ns <- sapply(display_splits, function(s) h$splits[[s]]$n)
-        c(Hitter = h$name, N = nrow(h$data), vals)
+        vals <- sapply(display_splits, function(s) {
+          v <- h$splits[[s]]$rv100
+          if (is.null(v) || is.na(v)) NA_real_ else round(v, 2)
+        })
+        data.frame(Hitter = h$name, N = nrow(h$data), t(vals), stringsAsFactors = FALSE, check.names = FALSE)
       })
       
-      df <- do.call(rbind, rows) %>% as.data.frame()
+      df <- do.call(rbind, rows)
       names(df) <- c("Hitter", "N", sapply(display_splits, function(s) MM_ALL_SPLITS[[s]]$name))
       df$N <- as.integer(df$N)
       for (col in names(df)[3:ncol(df)]) df[[col]] <- as.numeric(df[[col]])
@@ -3009,16 +4178,20 @@ server <- function(input, output, session) {
     }
     
     # Pitcher Profiles
-    else if (input$mm_view_mode == "pitcher_profiles") {
+else if (input$mm_view_mode == "pitcher_profiles") {
       req(cd$pitchers)
       display_splits <- mm_get_display_splits()
+      req(length(display_splits) > 0)
       
       rows <- lapply(cd$pitchers, function(p) {
-        vals <- sapply(display_splits, function(s) round(p$splits[[s]]$rv100, 2))
-        c(Pitcher = p$name, N = nrow(p$data), vals)
+        vals <- sapply(display_splits, function(s) {
+          v <- p$splits[[s]]$rv100
+          if (is.null(v) || is.na(v)) NA_real_ else round(v, 2)
+        })
+        data.frame(Pitcher = p$name, N = nrow(p$data), t(vals), stringsAsFactors = FALSE, check.names = FALSE)
       })
       
-      df <- do.call(rbind, rows) %>% as.data.frame()
+      df <- do.call(rbind, rows)
       names(df) <- c("Pitcher", "N", sapply(display_splits, function(s) MM_ALL_SPLITS[[s]]$name))
       df$N <- as.integer(df$N)
       for (col in names(df)[3:ncol(df)]) df[[col]] <- as.numeric(df[[col]])
@@ -3039,8 +4212,366 @@ server <- function(input, output, session) {
         tab_style(style = cell_text(weight = "bold"), locations = cells_body(columns = "Pitcher"))
     }
   })
+
+  tc_league_baseline <- reactive({
+    calc_league_baseline(active_data())
+  })
+
+  tc_card_data <- eventReactive(input$tc_build, {
+    req(input$tc_hitter, input$tc_hitter != "")
+
+    showNotification("Building tendency card...", type = "message", duration = 2)
+    baseline <- tc_league_baseline()
+    card <- calc_hitter_tendency_card(input$tc_hitter, active_data(), baseline)
+
+    if (is.null(card)) {
+      showNotification("Insufficient data for this hitter", type = "warning")
+      return(NULL)
+    }
+
+    overlay <- NULL
+    if (!is.null(input$tc_pitcher) && input$tc_pitcher != "") {
+      overlay <- overlay_pitcher_on_tendency(card, input$tc_pitcher, active_data(), baseline)
+    }
+
+    list(card = card, overlay = overlay)
+  })
+
+  # ---------- Summary box ----------
+
+  output$tc_summary <- renderUI({
+    req(tc_card_data())
+    cd <- tc_card_data()
+    card <- cd$card
+    if (is.null(card)) return(NULL)
+
+    n_vuln <- length(card$vulnerabilities)
+    n_str <- length(card$strengths)
+
+    div(class = "tc-summary-box",
+      h4(paste0(format_short_name(card$name), " ", format_batter_hand(card$batter_side),
+                " — Tendency Card")),
+      p(paste0("Total pitches: ", card$n_total,
+               " | Vulnerabilities: ", n_vuln,
+               " | Strengths: ", n_str)),
+      p(paste0("Overall: Whiff ", card$overall$whiff_rate, "% | Chase ",
+               card$overall$chase_rate, "% | Damage ", card$overall$damage_rate,
+               "% | wOBA ", card$overall$woba))
+    )
+  })
+
+  # ---------- Helper: build HTML grid from tendency card data ----------
+
+  tc_build_grid <- function(card_section, row_names, col_names, metric) {
+
+    vuln_class <- function(cell) {
+      if (is.null(cell) || is.na(cell$vulnerability) || cell$vulnerability == "unknown") return("tc-empty")
+      switch(cell$vulnerability,
+        "high_vuln" = "tc-high-vuln",
+        "vuln_whiff" = "tc-vuln",
+        "vuln_chase" = "tc-vuln",
+        "strength" = "tc-strength",
+        "tc-neutral"
+      )
+    }
+
+    format_cell <- function(cell, metric) {
+      if (is.null(cell) || cell$n < 10) {
+        return(tags$td(class = "tc-empty", paste0("(", if(is.null(cell)) 0 else cell$n, ")")))
+      }
+      val <- cell[[metric]]
+      if (is.na(val)) return(tags$td(class = "tc-empty", paste0("n=", cell$n)))
+
+      display <- if (metric == "woba") sprintf("%.3f", val) else sprintf("%.1f%%", val)
+
+      tags$td(class = vuln_class(cell),
+        div(style = "font-weight: 600;", display),
+        div(style = "font-size: 9px; color: #888;", paste0("n=", cell$n))
+      )
+    }
+
+    header <- tags$tr(
+      tags$th(""),
+      lapply(col_names, function(cn) tags$th(cn))
+    )
+
+    rows <- lapply(row_names, function(rn) {
+      tags$tr(
+        tags$td(class = "row-label", rn),
+        lapply(col_names, function(cn) {
+          col_key <- switch(cn,
+            "First Pitch" = "first_pitch", "Early" = "early",
+            "2 Strike" = "two_strike", "Ahead" = "ahead", "Behind" = "behind",
+            "Overall" = "overall",
+            cn
+          )
+          cell <- card_section[[rn]][[col_key]]
+          format_cell(cell, metric)
+        })
+      )
+    })
+
+    tags$table(class = "tc-grid-table",
+      tags$thead(header),
+      tags$tbody(rows)
+    )
+  }
+
+  # ---------- Shape x Count grid ----------
+
+  output$tc_shape_count_grid <- renderUI({
+    req(tc_card_data())
+    card <- tc_card_data()$card
+    if (is.null(card)) return(NULL)
+
+    metric <- input$tc_metric
+    row_names <- c("Ride FB", "Sink/Run", "Cutter", "Sweep", "Slider", "Curveball",
+                   "CH/SPL", "All FB", "All BB", "All OS")
+    row_names <- row_names[row_names %in% names(card$shape_count)]
+    col_names <- c("Overall", "First Pitch", "Early", "2 Strike", "Ahead", "Behind")
+
+    tc_build_grid(card$shape_count, row_names, col_names, metric)
+  })
+
+  # ---------- Shape x Zone grid ----------
+
+  output$tc_shape_zone_grid <- renderUI({
+    req(tc_card_data())
+    card <- tc_card_data()$card
+    if (is.null(card)) return(NULL)
+
+    metric <- input$tc_metric
+    row_names <- c("Ride FB", "Sink/Run", "Cutter", "Sweep", "Slider", "Curveball",
+                   "CH/SPL", "All FB", "All BB", "All OS")
+    row_names <- row_names[row_names %in% names(card$shape_zone)]
+    col_names <- c("Elevated", "UpIn", "UpAway", "Heart", "DownIn", "DownAway", "GloveDown", "ArmDown")
+
+    tc_build_grid(card$shape_zone, row_names, col_names, metric)
+  })
+
+  # ---------- Zone x Count grid ----------
+
+  output$tc_zone_count_grid <- renderUI({
+    req(tc_card_data())
+    card <- tc_card_data()$card
+    if (is.null(card)) return(NULL)
+
+    metric <- input$tc_metric
+    row_names <- c("Elevated", "UpIn", "UpAway", "Heart", "DownIn", "DownAway", "GloveDown", "ArmDown")
+    row_names <- row_names[row_names %in% names(card$zone_count)]
+    col_names <- c("Overall", "First Pitch", "Early", "2 Strike", "Ahead", "Behind")
+
+    tc_build_grid(card$zone_count, row_names, col_names, metric)
+  })
+
+  # ---------- Vulnerability / Strength summary ----------
+
+  output$tc_vuln_summary <- renderUI({
+    req(tc_card_data())
+    card <- tc_card_data()$card
+    if (is.null(card)) return(NULL)
+
+    vuln_ui <- if (length(card$vulnerabilities) > 0) {
+      lapply(names(card$vulnerabilities), function(label) {
+        cell <- card$vulnerabilities[[label]]
+        details <- paste0(
+          "Whiff: ", if(!is.na(cell$whiff_rate)) paste0(cell$whiff_rate, "%") else "-",
+          " | Chase: ", if(!is.na(cell$chase_rate)) paste0(cell$chase_rate, "%") else "-",
+          " | n=", cell$n
+        )
+        div(class = "tc-rec-card rec-bad",
+          div(class = "tc-rec-pitch", paste0("\u26A0 ", label)),
+          div(class = "tc-rec-detail", details)
+        )
+      })
+    } else {
+      list(p(style = "color: #999; font-size: 12px;", "No significant vulnerabilities detected"))
+    }
+
+    str_ui <- if (length(card$strengths) > 0) {
+      lapply(names(card$strengths), function(label) {
+        cell <- card$strengths[[label]]
+        details <- paste0(
+          "Damage: ", if(!is.na(cell$damage_rate)) paste0(cell$damage_rate, "%") else "-",
+          " | wOBA: ", if(!is.na(cell$woba)) cell$woba else "-",
+          " | n=", cell$n
+        )
+        div(class = "tc-rec-card rec-good",
+          div(class = "tc-rec-pitch", paste0("\u2705 ", label)),
+          div(class = "tc-rec-detail", details)
+        )
+      })
+    } else {
+      list(p(style = "color: #999; font-size: 12px;", "No significant strengths detected"))
+    }
+
+    tagList(
+      div(style = "margin-bottom: 12px;",
+        tags$label(style = "font-weight: 700; color: #C62828; font-size: 13px;", "Vulnerabilities (exploit these):"),
+        vuln_ui
+      ),
+      div(
+        tags$label(style = "font-weight: 700; color: #2E7D32; font-size: 13px;", "Strengths (avoid these):"),
+        str_ui
+      )
+    )
+  })
+
+  # ---------- Pitcher overlay title ----------
+
+  output$tc_overlay_title <- renderText({
+    req(tc_card_data())
+    overlay <- tc_card_data()$overlay
+    if (is.null(overlay)) return("No pitcher overlay")
+    paste0("Pitcher Overlay: ", overlay$pitcher_name, " (", overlay$pitcher_hand, "HP)",
+           " vs ", overlay$hitter_name)
+  })
+
+  # ---------- Pitcher overlay content ----------
+
+  output$tc_pitcher_overlay <- renderUI({
+    req(tc_card_data())
+    overlay <- tc_card_data()$overlay
+    if (is.null(overlay)) return(div(style = "color: #999;", "Select a pitcher and rebuild"))
+
+    arsenal_ui <- tags$table(class = "tc-grid-table",
+      tags$thead(tags$tr(
+        tags$th("Pitch"), tags$th("Usage%"), tags$th("Velo"), tags$th("IVB"), tags$th("HB"),
+        tags$th("P Whiff%"), tags$th("Zone%")
+      )),
+      tags$tbody(
+        lapply(seq_len(nrow(overlay$arsenal)), function(i) {
+          row <- overlay$arsenal[i, ]
+          tags$tr(
+            tags$td(class = "row-label", row$movement_tag),
+            tags$td(sprintf("%.1f%%", row$pct)),
+            tags$td(sprintf("%.1f", row$avg_velo)),
+            tags$td(sprintf("%.1f", row$avg_ivb)),
+            tags$td(sprintf("%.1f", row$avg_hb)),
+            tags$td(sprintf("%.1f%%", row$whiff_rate * 100)),
+            tags$td(sprintf("%.1f%%", row$zone_pct * 100))
+          )
+        })
+      )
+    )
+
+    rec_ui <- lapply(c("first_pitch", "early", "two_strike"), function(ct) {
+      recs <- overlay$recommendations[[ct]]
+      if (is.null(recs) || length(recs) == 0) return(NULL)
+
+      ct_label <- c("first_pitch" = "First Pitch", "early" = "Early Count", "two_strike" = "2 Strikes")[[ct]]
+
+      vuln_order <- c("high_vuln" = 1, "vuln_whiff" = 2, "vuln_chase" = 3, "neutral" = 4, "strength" = 5)
+      recs_sorted <- recs[order(sapply(recs, function(r) {
+        if (is.null(r$h_vuln) || is.na(r$h_vuln)) 4 else vuln_order[r$h_vuln]
+      }))]
+
+      rec_cards <- lapply(recs_sorted, function(r) {
+        card_class <- switch(r$h_vuln,
+          "high_vuln" = "rec-good", "vuln_whiff" = "rec-good", "vuln_chase" = "rec-good",
+          "strength" = "rec-bad", "rec-neutral"
+        )
+
+        action_label <- switch(r$h_vuln,
+          "high_vuln" = "\u2705 ATTACK",
+          "vuln_whiff" = "\u2705 Go-to pitch",
+          "vuln_chase" = "\u2705 Chase bait",
+          "strength" = "\u274C AVOID",
+          "\u2796 Neutral"
+        )
+
+        detail_parts <- c(
+          paste0("Usage: ", sprintf("%.0f%%", r$usage_pct)),
+          if (!is.na(r$h_whiff)) paste0("H-Whiff: ", r$h_whiff, "%"),
+          if (!is.na(r$h_chase)) paste0("H-Chase: ", r$h_chase, "%"),
+          if (!is.na(r$h_damage)) paste0("H-Dmg: ", r$h_damage, "%"),
+          if (!is.na(r$matchup_whiff)) paste0("Log5 Whiff: ", r$matchup_whiff, "%")
+        )
+
+        zone_note <- if (!is.null(r$best_zone)) {
+          paste0(" \u2192 Target: ", r$best_zone$zone,
+                 " (pitcher hits it ", sprintf("%.0f%%", r$best_zone$pct), " of the time, ",
+                 "hitter ", r$best_zone$h_vuln, " there)")
+        } else ""
+
+        div(class = paste("tc-rec-card", card_class),
+          div(class = "tc-rec-pitch", paste0(action_label, " — ", r$shape_group, " (", r$pitch, ")")),
+          div(class = "tc-rec-detail", paste(detail_parts, collapse = " | ")),
+          if (nchar(zone_note) > 0) div(class = "tc-rec-detail", style = "font-style: italic;", zone_note)
+        )
+      })
+
+      div(style = "margin-bottom: 15px;",
+        div(class = "tc-overlay-header", ct_label),
+        rec_cards
+      )
+    })
+
+    tagList(
+      div(style = "margin-bottom: 15px;", arsenal_ui),
+      hr(),
+      tags$label(style = "font-weight: 700; color: #006F71; font-size: 14px;", "Sequence Recommendations"),
+      rec_ui
+    )
+  })
+
+  # ---------- PDF Download ----------
+
+  output$tc_download_pdf <- downloadHandler(
+    filename = function() {
+      h <- if (!is.null(input$tc_hitter)) gsub(" ", "_", input$tc_hitter) else "hitter"
+      paste0("tendency_card_", h, "_", format(Sys.Date(), "%Y%m%d"), ".pdf")
+    },
+    content = function(file) {
+      req(tc_card_data())
+      cd <- tc_card_data()
+      card <- cd$card
+      if (is.null(card)) {
+        showNotification("No card data", type = "warning")
+        return()
+      }
+
+      metric <- input$tc_metric
+
+      shape_names <- c("Ride FB", "Sink/Run", "Cutter", "Sweep", "Slider", "Curveball", "CH/SPL")
+      shape_names <- shape_names[shape_names %in% names(card$shape_count)]
+      count_cols <- c("overall", "first_pitch", "early", "two_strike", "ahead", "behind")
+      count_labels <- c("Overall", "1st Pitch", "Early", "2K", "Ahead", "Behind")
+
+      rows <- lapply(shape_names, function(sn) {
+        vals <- sapply(count_cols, function(cc) {
+          cell <- card$shape_count[[sn]][[cc]]
+          if (is.null(cell) || cell$n < 10 || is.na(cell[[metric]])) NA_real_
+          else cell[[metric]]
+        })
+        c(Shape = sn, setNames(vals, count_labels))
+      })
+
+      df <- do.call(rbind, rows) %>% as.data.frame(stringsAsFactors = FALSE)
+      for (col in count_labels) df[[col]] <- as.numeric(df[[col]])
+
+      gt_tbl <- df %>%
+        gt() %>%
+        tab_header(
+          title = paste0("Tendency Card: ", card$name, " ", format_batter_hand(card$batter_side)),
+          subtitle = paste0("Metric: ", metric, " | n=", card$n_total, " pitches | Log5 adjusted")
+        ) %>%
+        data_color(columns = all_of(count_labels), fn = scales::col_numeric(
+          palette = c("#1e8449", "#f5f5f5", "#c0392b"),
+          domain = if (metric == "woba") c(0.150, 0.320, 0.500) else c(10, 25, 50),
+          na.color = "#eee"
+        )) %>%
+        cols_align(align = "center") %>%
+        sub_missing(missing_text = "-") %>%
+        tab_options(table.font.size = px(12), column_labels.font.weight = "bold",
+                   column_labels.background.color = "#e8f5f4") %>%
+        tab_style(style = cell_text(weight = "bold"), locations = cells_body(columns = "Shape"))
+
+      gtsave(gt_tbl, file)
+    }
+  )
   
-  # Helper function to generate a gt table for a specific view
+ # Helper function to generate a gt table for a specific view
   mm_generate_gt_table <- function(view_mode, split_name = NULL, custom_splits = NULL) {
     cd <- mm_calc_data()
     if (is.null(cd)) return(NULL)
@@ -3111,17 +4642,36 @@ server <- function(input, output, session) {
     else if (view_mode == "hitter_profiles") {
       if (is.null(cd$hitters) || length(display_splits) == 0) return(NULL)
       
+      # Check if count columns should be added (for pitch group/platoon views)
+      add_counts <- isTRUE(input$mm_show_counts)
+      
       rows <- lapply(cd$hitters, function(h) {
         vals <- sapply(display_splits, function(s) round(h$splits[[s]]$rv100, 2))
-        c(Hitter = h$name, N = nrow(h$data), vals)
+        base_row <- c(Hitter = h$name, N = nrow(h$data), vals)
+        
+        if (add_counts) {
+          # Calculate count-based RV for this hitter
+          count_splits <- mm_calc_count_splits(h$data, "mean_DRE_bat", pitcher_hand = NULL, is_pitcher = FALSE)
+          count_vals <- sapply(c("0-0", "hitters", "pitchers", "2k"), function(ct) {
+            if (!is.null(count_splits[[ct]])) round(count_splits[[ct]]$rv100, 2) else NA_real_
+          })
+          names(count_vals) <- c("0-0", "Hitter Ct", "Pitcher Ct", "2 Strikes")
+          base_row <- c(base_row, count_vals)
+        }
+        base_row
       })
       
       df <- do.call(rbind, rows) %>% as.data.frame()
-      names(df) <- c("Hitter", "N", sapply(display_splits, function(s) MM_ALL_SPLITS[[s]]$name))
+      split_names <- sapply(display_splits, function(s) MM_ALL_SPLITS[[s]]$name)
+      if (add_counts) {
+        names(df) <- c("Hitter", "N", split_names, "0-0", "Hitter Ct", "Pitcher Ct", "2 Strikes")
+      } else {
+        names(df) <- c("Hitter", "N", split_names)
+      }
       df$N <- as.integer(df$N)
       for (col in names(df)[3:ncol(df)]) df[[col]] <- as.numeric(df[[col]])
       
-      df %>%
+      tbl <- df %>%
         gt() %>%
         tab_header(title = "Hitter Profiles", subtitle = "RV/100 (positive = good for hitter) | Hierarchically regressed") %>%
         data_color(columns = 3:ncol(df), fn = scales::col_numeric(
@@ -3130,22 +4680,47 @@ server <- function(input, output, session) {
         cols_align(align = "center") %>%
         tab_options(table.font.size = "13px", column_labels.font.weight = "bold", column_labels.background.color = "#e8f5f4") %>%
         tab_style(style = cell_text(weight = "bold"), locations = cells_body(columns = "Hitter"))
+      
+      # Add spanner for count columns if present
+      if (add_counts) {
+        tbl <- tbl %>%
+          tab_spanner(label = "By Count (RV/100)", columns = c("0-0", "Hitter Ct", "Pitcher Ct", "2 Strikes"))
+      }
+      
+      tbl
     }
     
     else if (view_mode == "pitcher_profiles") {
       if (is.null(cd$pitchers) || length(display_splits) == 0) return(NULL)
       
+      add_counts <- isTRUE(input$mm_show_counts)
+      
       rows <- lapply(cd$pitchers, function(p) {
         vals <- sapply(display_splits, function(s) round(p$splits[[s]]$rv100, 2))
-        c(Pitcher = p$name, N = nrow(p$data), vals)
+        base_row <- c(Pitcher = p$name, N = nrow(p$data), vals)
+        
+        if (add_counts) {
+          count_splits <- mm_calc_count_splits(p$data, "mean_DRE_pit", pitcher_hand = NULL, is_pitcher = TRUE)
+          count_vals <- sapply(c("0-0", "hitters", "pitchers", "2k"), function(ct) {
+            if (!is.null(count_splits[[ct]])) round(count_splits[[ct]]$rv100, 2) else NA_real_
+          })
+          names(count_vals) <- c("0-0", "Hitter Ct", "Pitcher Ct", "2 Strikes")
+          base_row <- c(base_row, count_vals)
+        }
+        base_row
       })
       
       df <- do.call(rbind, rows) %>% as.data.frame()
-      names(df) <- c("Pitcher", "N", sapply(display_splits, function(s) MM_ALL_SPLITS[[s]]$name))
+      split_names <- sapply(display_splits, function(s) MM_ALL_SPLITS[[s]]$name)
+      if (add_counts) {
+        names(df) <- c("Pitcher", "N", split_names, "0-0", "Hitter Ct", "Pitcher Ct", "2 Strikes")
+      } else {
+        names(df) <- c("Pitcher", "N", split_names)
+      }
       df$N <- as.integer(df$N)
       for (col in names(df)[3:ncol(df)]) df[[col]] <- as.numeric(df[[col]])
       
-      df %>%
+      tbl <- df %>%
         gt() %>%
         tab_header(title = "Pitcher Profiles", subtitle = "RV/100 (negative = good for pitcher) | Hierarchically regressed") %>%
         data_color(columns = 3:ncol(df), fn = scales::col_numeric(
@@ -3154,13 +4729,20 @@ server <- function(input, output, session) {
         cols_align(align = "center") %>%
         tab_options(table.font.size = "13px", column_labels.font.weight = "bold", column_labels.background.color = "#e8f5f4") %>%
         tab_style(style = cell_text(weight = "bold"), locations = cells_body(columns = "Pitcher"))
+      
+      if (add_counts) {
+        tbl <- tbl %>%
+          tab_spanner(label = "By Count (RV/100)", columns = c("0-0", "Hitter Ct", "Pitcher Ct", "2 Strikes"))
+      }
+      
+      tbl
     }
     
     else {
       NULL
     }
   }
-  
+
   # Download PNG of current view
   output$mm_download_png <- downloadHandler(
     filename = function() {
@@ -3173,281 +4755,689 @@ server <- function(input, output, session) {
       }
     }
   )
+
+  observeEvent(input$refresh_data, {
+    tryCatch({
+      showNotification("Refreshing data from HuggingFace...", type = "message", duration = 3)
+      new_data <- download_private_parquet("CoastalBaseball/2026MasterDataset", "pbp_2026_master.parquet")
+      new_data <- process_pitcher_data(new_data, bio_heights, "data_ind")$data
+      data_2026_rv(new_data)
+      
+      new_hitters <- sort(unique(new_data$Batter[!is.na(new_data$Batter) & new_data$Batter != ""]))
+      new_pitchers <- sort(unique(new_data$Pitcher[!is.na(new_data$Pitcher) & new_data$Pitcher != ""]))
+      all_hitters <<- sort(unique(c(all_hitters_2025, new_hitters)))
+      all_pitchers <<- sort(unique(c(all_pitchers_2025, new_pitchers)))
+      
+      updateSelectizeInput(session, "scout_hitters", choices = all_hitters, server = TRUE)
+      updateSelectizeInput(session, "mm_hitters", choices = all_hitters, server = TRUE)
+      updateSelectizeInput(session, "mm_pitchers", choices = all_pitchers, server = TRUE)
+      
+      showNotification(paste0("Data refreshed! ", nrow(new_data), " rows loaded."), type = "message")
+    }, error = function(e) {
+      showNotification(paste("Refresh failed:", e$message), type = "error")
+    })
+  })                       
+
+                          
+
+# Download PNG of current view - uses gt::gtsave as self-contained HTML
+  output$mm_download_png <- downloadHandler(
+    filename = function() {
+      paste0("matchup_", input$mm_view_mode, "_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".html")
+    },
+    content = function(file) {
+      gt_tbl <- mm_generate_gt_table(input$mm_view_mode, input$mm_selected_split)
+      if (!is.null(gt_tbl)) {
+        gtsave(gt_tbl, file)
+      } else {
+        writeLines("<html><body><h2>No data to display</h2></body></html>", file)
+      }
+    }
+  )
   
-  # Download PDF with all views
-  output$mm_download_pdf <- downloadHandler(
+
+output$mm_download_pdf <- downloadHandler(
     filename = function() {
       paste0("matchup_report_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".pdf")
     },
     content = function(file) {
-      temp_dir <- tempdir()
-      img_files <- list()
+      cd <- mm_calc_data()
+      if (is.null(cd)) { showNotification("No data. Click Analyze first.", type = "warning"); return() }
       
-      # Define pitch family and platoon splits
-      family_platoon_splits <- c("fb_rhp", "bb_rhp", "os_rhp", "fb_lhp", "bb_lhp", "os_lhp", "vs_rhp", "vs_lhp", "overall")
-      
-      # Generate tables
-      tables_to_generate <- list(
-        list(name = "Overall Matrix", view = "matrix_overall", splits = NULL),
-        list(name = "Hitter Profiles (Movement)", view = "hitter_profiles", splits = mm_get_display_splits()),
-        list(name = "Pitcher Profiles (Movement)", view = "pitcher_profiles", splits = mm_get_display_splits()),
-        list(name = "Hitter Profiles (Family/Platoon)", view = "hitter_profiles", splits = family_platoon_splits),
-        list(name = "Pitcher Profiles (Family/Platoon)", view = "pitcher_profiles", splits = family_platoon_splits)
-      )
-      
-      for (tbl_info in tables_to_generate) {
-        gt_tbl <- mm_generate_gt_table(tbl_info$view, NULL, tbl_info$splits)
-        if (!is.null(gt_tbl)) {
-          img_path <- file.path(temp_dir, paste0(gsub("[^a-zA-Z0-9]", "_", tbl_info$name), ".png"))
-          tryCatch({
-            gtsave(gt_tbl, img_path, vwidth = 1400)
-            img_files[[tbl_info$name]] <- img_path
-          }, error = function(e) {
-            message("Error saving ", tbl_info$name, ": ", e$message)
-          })
-        }
-      }
-      
-      # Build HTML content with custom inputs
       report_title <- if (nchar(input$mm_pdf_title) > 0) input$mm_pdf_title else "Matchup Matrix Report"
       best_matchups <- input$mm_pdf_best_matchups
       worst_matchups <- input$mm_pdf_worst_matchups
-      notes <- input$mm_pdf_notes
+      notes_text <- input$mm_pdf_notes
       
-      html_content <- paste0(
-        '<!DOCTYPE html><html><head>',
-        '<style>',
-        '@page { size: letter landscape; margin: 0.5in; }',
-        'body { font-family: Arial, sans-serif; margin: 0; padding: 20px; }',
-        '.header { text-align: center; margin-bottom: 30px; padding-bottom: 20px; border-bottom: 3px solid #006F71; }',
-        'h1 { color: #006F71; margin: 0 0 10px; font-size: 28px; }',
-        '.timestamp { color: #666; font-size: 12px; }',
-        '.notes-section { background: #f8f9fa; border-radius: 8px; padding: 20px; margin-bottom: 30px; }',
-        '.notes-section h3 { color: #006F71; margin: 0 0 10px; font-size: 16px; }',
-        '.notes-row { display: flex; gap: 20px; margin-bottom: 15px; }',
-        '.notes-box { flex: 1; }',
-        '.notes-box h4 { color: #CD853F; margin: 0 0 8px; font-size: 14px; }',
-        '.notes-box p { margin: 0; font-size: 13px; line-height: 1.5; white-space: pre-wrap; }',
-        '.matchups-good { border-left: 4px solid #27ae60; padding-left: 12px; }',
-        '.matchups-bad { border-left: 4px solid #c0392b; padding-left: 12px; }',
-        '.table-section { margin-bottom: 40px; page-break-inside: avoid; }',
-        '.table-section h3 { color: #006F71; font-size: 16px; margin-bottom: 15px; }',
-        'img { max-width: 100%; height: auto; }',
-        '</style>',
-        '</head><body>',
-        '<div class="header">',
-        '<h1>', htmltools::htmlEscape(report_title), '</h1>',
-        '<p class="timestamp">Generated: ', format(Sys.time(), "%B %d, %Y at %I:%M %p"), '</p>',
-        '</div>'
-      )
-      
-      # Add notes section if any content provided
-      if (nchar(best_matchups) > 0 || nchar(worst_matchups) > 0 || nchar(notes) > 0) {
-        html_content <- paste0(html_content, '<div class="notes-section">')
-        
-        if (nchar(best_matchups) > 0 || nchar(worst_matchups) > 0) {
-          html_content <- paste0(html_content, '<div class="notes-row">')
-          
-          if (nchar(best_matchups) > 0) {
-            html_content <- paste0(html_content,
-              '<div class="notes-box matchups-good">',
-              '<h4>Best Matchups</h4>',
-              '<p>', htmltools::htmlEscape(best_matchups), '</p>',
-              '</div>')
-          }
-          
-          if (nchar(worst_matchups) > 0) {
-            html_content <- paste0(html_content,
-              '<div class="notes-box matchups-bad">',
-              '<h4>Worst Matchups</h4>',
-              '<p>', htmltools::htmlEscape(worst_matchups), '</p>',
-              '</div>')
-          }
-          
-          html_content <- paste0(html_content, '</div>')
-        }
-        
-        if (nchar(notes) > 0) {
-          html_content <- paste0(html_content,
-            '<div class="notes-box">',
-            '<h4>Notes</h4>',
-            '<p>', htmltools::htmlEscape(notes), '</p>',
-            '</div>')
-        }
-        
-        html_content <- paste0(html_content, '</div>')
+      # Helper: render gt table to PNG via gtsave (native sizing, no manual webshot)
+      gt_save_png <- function(gt_tbl) {
+        if (is.null(gt_tbl)) return(NULL)
+        tmp_png <- tempfile(fileext = ".png")
+        tryCatch({
+          gtsave(gt_tbl, tmp_png, zoom = 3, expand = 5)
+          if (file.exists(tmp_png)) tmp_png else NULL
+        }, error = function(e) { message("gtsave error: ", e$message); NULL })
       }
       
-      # Add table images
-      for (tbl_name in names(img_files)) {
-        img_path <- img_files[[tbl_name]]
-        if (file.exists(img_path)) {
-          img_data <- base64enc::base64encode(img_path)
-          html_content <- paste0(html_content,
-            '<div class="table-section">',
-            '<h3>', htmltools::htmlEscape(tbl_name), '</h3>',
-            '<img src="data:image/png;base64,', img_data, '">',
-            '</div>')
+      # ---- Build GT tables ----
+      
+      # Table 1: Overall Matchup Matrix
+      gt_overall <- NULL
+      if (!is.null(cd$hitters) && !is.null(cd$pitchers) && length(cd$hitters) > 0 && length(cd$pitchers) > 0) {
+        mat <- matrix(NA_real_, nrow = length(cd$hitters), ncol = length(cd$pitchers))
+        rownames(mat) <- sapply(cd$hitters, function(h) format_short_name(h$name))
+        colnames(mat) <- sapply(cd$pitchers, function(p) format_short_name(p$name))
+        for (i in seq_along(cd$hitters)) {
+          for (j in seq_along(cd$pitchers)) {
+            overall <- mm_calc_overall_matchup(cd$hitters[[i]]$splits, cd$pitchers[[j]]$splits, cd$pitchers[[j]]$data)
+            mat[i, j] <- round(overall$rv, 2)
+          }
         }
+        gt_overall <- as.data.frame(mat) %>%
+          tibble::rownames_to_column("Hitter") %>%
+          gt() %>%
+          tab_header(title = "Overall Matchup Matrix (Weighted RV/100)",
+                    subtitle = "Positive = hitter advantage") %>%
+          data_color(columns = -Hitter, fn = scales::col_numeric(
+            palette = c("#c0392b", "#e74c3c", "#f5f5f5", "#27ae60", "#1e8449"),
+            domain = c(-10, -3, 0, 3, 10), na.color = "#eee")) %>%
+          cols_align(align = "center") %>%
+          tab_options(table.font.size = px(12), column_labels.font.weight = "bold",
+                     column_labels.background.color = "#e8f5f4",
+                     data_row.padding = px(4)) %>%
+          tab_style(style = cell_text(weight = "bold"), locations = cells_body(columns = "Hitter"))
       }
       
-      html_content <- paste0(html_content, '</body></html>')
+      # Table 2: Hitter Platoon + Pitch Group + Counts
+      gt_pitch_group <- NULL
+      if (!is.null(cd$hitters) && length(cd$hitters) > 0) {
+        pg_splits <- c("vs_rhp", "vs_lhp", "fb_rhp", "bb_rhp", "os_rhp", "fb_lhp", "bb_lhp", "os_lhp")
+        valid_splits <- pg_splits[pg_splits %in% names(MM_ALL_SPLITS)]
+        
+        rows <- lapply(cd$hitters, function(h) {
+          vals <- sapply(valid_splits, function(s) {
+            v <- h$splits[[s]]$rv100; if (is.null(v) || is.na(v)) NA_real_ else round(v, 2)
+          })
+          count_splits <- mm_calc_count_splits(h$data, "mean_DRE_bat", pitcher_hand = NULL, is_pitcher = FALSE)
+          count_vals <- sapply(c("0-0", "hitters", "pitchers", "2k"), function(ct) {
+            if (!is.null(count_splits[[ct]]) && !is.na(count_splits[[ct]]$rv100)) round(count_splits[[ct]]$rv100, 2) else NA_real_
+          })
+          c(Hitter = format_short_name(h$name), N = nrow(h$data), vals, count_vals)
+        })
+        
+        df_pg <- do.call(rbind, rows) %>% as.data.frame(stringsAsFactors = FALSE)
+        split_names <- sapply(valid_splits, function(s) MM_ALL_SPLITS[[s]]$name)
+        names(df_pg) <- c("Hitter", "N", split_names, "0-0", "Hitter Ct", "Pitcher Ct", "2 Strikes")
+        df_pg$N <- as.integer(df_pg$N)
+        for (col in names(df_pg)[3:ncol(df_pg)]) df_pg[[col]] <- as.numeric(df_pg[[col]])
+        
+        gt_pitch_group <- df_pg %>%
+          gt() %>%
+          tab_header(title = "Hitter Profiles: Platoon / Pitch Group / Counts",
+                    subtitle = "RV/100 — Positive = good for hitter") %>%
+          tab_spanner(label = "Platoon", columns = any_of(c("vs RHP", "vs LHP"))) %>%
+          tab_spanner(label = "vs RHP Pitch Group", columns = any_of(c("All FB (RHP)", "All BB (RHP)", "All OS (RHP)"))) %>%
+          tab_spanner(label = "vs LHP Pitch Group", columns = any_of(c("All FB (LHP)", "All BB (LHP)", "All OS (LHP)"))) %>%
+          tab_spanner(label = "By Count", columns = c("0-0", "Hitter Ct", "Pitcher Ct", "2 Strikes")) %>%
+          data_color(columns = 3:ncol(df_pg), fn = scales::col_numeric(
+            palette = c("#c0392b", "#e74c3c", "#f5f5f5", "#27ae60", "#1e8449"),
+            domain = c(-15, -5, 0, 5, 15), na.color = "#eee")) %>%
+          cols_align(align = "center") %>%
+          sub_missing(missing_text = "-") %>%
+          tab_options(table.font.size = px(11), column_labels.font.weight = "bold",
+                     column_labels.font.size = px(10),
+                     column_labels.background.color = "#e8f5f4",
+                     data_row.padding = px(3)) %>%
+          tab_style(style = cell_text(weight = "bold"), locations = cells_body(columns = "Hitter"))
+      }
       
-      html_file <- file.path(temp_dir, "report.html")
-      writeLines(html_content, html_file)
+      # Table 3: Hitter Movement Splits
+      gt_movement <- NULL
+      if (!is.null(cd$hitters) && length(cd$hitters) > 0) {
+        mvmt_splits <- c("ride_fb_rhp", "sink_fb_rhp", "hard_velo_rhp", "sweep_rhp", "downer_rhp", "gyro_cut_rhp", "chspl_rhp",
+                         "ride_fb_lhp", "sink_fb_lhp", "hard_velo_lhp", "sweep_lhp", "downer_lhp", "gyro_cut_lhp", "chspl_lhp")
+        valid_mvmt <- mvmt_splits[mvmt_splits %in% names(MM_ALL_SPLITS)]
+        
+        rows <- lapply(cd$hitters, function(h) {
+          vals <- sapply(valid_mvmt, function(s) {
+            v <- h$splits[[s]]$rv100; if (is.null(v) || is.na(v)) NA_real_ else round(v, 2)
+          })
+          c(Hitter = format_short_name(h$name), N = nrow(h$data), vals)
+        })
+        
+        df_mvmt <- do.call(rbind, rows) %>% as.data.frame(stringsAsFactors = FALSE)
+        split_names <- sapply(valid_mvmt, function(s) MM_ALL_SPLITS[[s]]$name)
+        names(df_mvmt) <- c("Hitter", "N", split_names)
+        df_mvmt$N <- as.integer(df_mvmt$N)
+        for (col in names(df_mvmt)[3:ncol(df_mvmt)]) df_mvmt[[col]] <- as.numeric(df_mvmt[[col]])
+        
+        gt_movement <- df_mvmt %>%
+          gt() %>%
+          tab_header(title = "Hitter Profiles: Movement Splits",
+                    subtitle = "RV/100 — Hierarchically regressed") %>%
+          data_color(columns = 3:ncol(df_mvmt), fn = scales::col_numeric(
+            palette = c("#c0392b", "#e74c3c", "#f5f5f5", "#27ae60", "#1e8449"),
+            domain = c(-15, -5, 0, 5, 15), na.color = "#eee")) %>%
+          cols_align(align = "center") %>%
+          sub_missing(missing_text = "-") %>%
+          tab_options(table.font.size = px(10), column_labels.font.weight = "bold",
+                     column_labels.font.size = px(9),
+                     column_labels.background.color = "#e8f5f4",
+                     data_row.padding = px(3)) %>%
+          tab_style(style = cell_text(weight = "bold"), locations = cells_body(columns = "Hitter"))
+      }
       
-      # Convert to PDF
-      tryCatch({
-        pagedown::chrome_print(html_file, file, wait = 15)
-      }, error = function(e) {
-        message("PDF generation error: ", e$message)
-        # Fallback: copy first image
-        if (length(img_files) > 0) {
-          file.copy(img_files[[1]], file)
+      # ---- Render gt tables to PNGs ----
+      png_overall <- gt_save_png(gt_overall)
+      png_pitch_group <- gt_save_png(gt_pitch_group)
+      png_movement <- gt_save_png(gt_movement)
+      
+      pdf(file, width = 8.5, height = 12, onefile = TRUE)
+      
+      page_w_in <- 8.5
+      page_h_in <- 11
+      margin_in <- 0.3
+      usable_w_in <- page_w_in - 2 * margin_in  # 7.9 inches usable
+      
+      # Header banner
+      grid::grid.rect(x = 0.5, y = 0.978, width = 1, height = 0.035,
+                     gp = grid::gpar(fill = "#006F71", col = NA))
+      grid::grid.text(report_title, x = 0.5, y = 0.978,
+                     gp = grid::gpar(fontsize = 13, fontface = "bold", col = "white"))
+      grid::grid.text(format(Sys.Date(), "%m/%d/%Y"), x = 0.95, y = 0.978, just = "right",
+                     gp = grid::gpar(fontsize = 7, col = "white"))
+      
+      # ---- 4-Column Notes Table ----
+      # Columns: Good Matchups | Bad Matchups | Available RHP | Available LHP
+      # Uses input fields; falls back gracefully if new inputs don't exist yet
+      cur_y_in <- page_h_in * 0.955
+      
+      best_text <- best_matchups
+      worst_text <- worst_matchups
+      avail_rhp <- tryCatch(input$mm_pdf_avail_rhp, error = function(e) "")
+      avail_lhp <- tryCatch(input$mm_pdf_avail_lhp, error = function(e) "")
+      if (is.null(avail_rhp)) avail_rhp <- ""
+      if (is.null(avail_lhp)) avail_lhp <- ""
+      # If no separate avail fields, use notes_text as fallback content
+      notes_fallback <- if (nchar(avail_rhp) == 0 && nchar(avail_lhp) == 0 && nchar(notes_text) > 0) notes_text else ""
+      
+      has_any_notes <- nchar(best_text) > 0 || nchar(worst_text) > 0 || 
+                       nchar(avail_rhp) > 0 || nchar(avail_lhp) > 0 || nchar(notes_fallback) > 0
+      
+      if (has_any_notes) {
+        # Table dimensions in inches
+        table_left <- 0.3
+        table_w <- usable_w_in
+        col_w <- table_w / 4
+        header_h <- 0.22
+        body_h <- 0.90  # generous space for content
+        card_total_h <- header_h + body_h + 0.05  # padding
+        
+        # Convert to NPC for drawing
+        npc_left <- table_left / page_w_in
+        npc_w <- table_w / page_w_in
+        npc_col_w <- col_w / page_w_in
+        npc_header_h <- header_h / page_h_in
+        npc_body_h <- body_h / page_h_in
+        npc_total_h <- card_total_h / page_h_in
+        
+        card_top_npc <- cur_y_in / page_h_in
+        
+        # Background card
+        grid::grid.rect(x = 0.5, y = card_top_npc - npc_total_h / 2, 
+                       width = npc_w + 0.02, height = npc_total_h,
+                       default.units = "npc",
+                       gp = grid::gpar(fill = "#f8fafa", col = "#d0d0d0", lwd = 0.5))
+        
+        # Column headers
+        col_headers <- c("Good Matchups for Coastal", "Bad Matchups for Coastal", 
+                         "Available RHP", "Available LHP")
+        col_colors <- c("#27ae60", "#c0392b", "#2962FF", "#c0392b")
+        col_contents <- c(best_text, worst_text, 
+                         if (nchar(avail_rhp) > 0) avail_rhp else notes_fallback, 
+                         avail_lhp)
+        
+        header_y <- card_top_npc - 0.004
+        
+        for (i in 1:4) {
+          col_x <- npc_left + (i - 1) * npc_col_w
+          col_center_x <- col_x + npc_col_w / 2
+          
+          # Vertical accent bar on left of each column
+          grid::grid.segments(x0 = col_x + 0.005, y0 = header_y + 0.002,
+                             x1 = col_x + 0.005, y1 = header_y - npc_header_h - npc_body_h,
+                             default.units = "npc", 
+                             gp = grid::gpar(col = col_colors[i], lwd = 2.5))
+          
+          # Header text
+          grid::grid.text(col_headers[i], x = col_x + 0.015, y = header_y,
+                         just = "left", default.units = "npc",
+                         gp = grid::gpar(fontsize = 6.5, fontface = "bold", col = col_colors[i]))
+          
+          # Content text — wrap manually into lines
+          if (nchar(col_contents[i]) > 0) {
+            content <- col_contents[i]
+            # Split on newlines first, then wrap long lines
+            raw_lines <- unlist(strsplit(content, "\n"))
+            wrapped <- character()
+            chars_per_line <- 35  # approximate chars that fit in column
+            for (rl in raw_lines) {
+              if (nchar(rl) <= chars_per_line) {
+                wrapped <- c(wrapped, rl)
+              } else {
+                words <- unlist(strsplit(rl, " "))
+                current_line <- ""
+                for (w in words) {
+                  test <- if (nchar(current_line) == 0) w else paste(current_line, w)
+                  if (nchar(test) > chars_per_line && nchar(current_line) > 0) {
+                    wrapped <- c(wrapped, current_line)
+                    current_line <- w
+                  } else {
+                    current_line <- test
+                  }
+                }
+                if (nchar(current_line) > 0) wrapped <- c(wrapped, current_line)
+              }
+            }
+            
+            # Draw each line
+            line_h <- 0.011
+            for (ln_idx in seq_along(wrapped)) {
+              ln_y <- header_y - 0.015 - (ln_idx - 1) * line_h
+              if (ln_y < card_top_npc - npc_total_h + 0.005) break  # don't overflow
+              grid::grid.text(wrapped[ln_idx], x = col_x + 0.015, y = ln_y,
+                             just = "left", default.units = "npc",
+                             gp = grid::gpar(fontsize = 5.5, col = "#333"))
+            }
+          }
+          
+          # Vertical divider between columns (except last)
+          if (i < 4) {
+            div_x <- col_x + npc_col_w
+            grid::grid.segments(x0 = div_x, y0 = card_top_npc - 0.002,
+                               x1 = div_x, y1 = card_top_npc - npc_total_h + 0.005,
+                               default.units = "npc",
+                               gp = grid::gpar(col = "#d0d0d0", lwd = 0.4))
+          }
         }
-      })
+        
+        cur_y_in <- (card_top_npc - npc_total_h) * page_h_in - 0.10
+      }
+      
+      # ---- Place PNG tables scaled to fill page width, preserving aspect ratio ----
+      # Tables render at native size via gtsave. We scale them to fill
+      # the usable page width so they look crisp but not tiny.
+      place_gt_png <- function(png_path, cur_y_in, max_w_in = usable_w_in, max_h_in = 4.0) {
+        img <- png::readPNG(png_path)
+        img_w_px <- ncol(img)
+        img_h_px <- nrow(img)
+        ar <- img_h_px / img_w_px  # aspect ratio
+        
+        # Scale to fill max width, height follows from aspect ratio
+        img_w_in <- max_w_in
+        img_h_in <- img_w_in * ar
+        
+        # Cap max height
+        if (img_h_in > max_h_in) {
+          img_h_in <- max_h_in
+          img_w_in <- img_h_in / ar
+        }
+        
+        center_y_in <- cur_y_in - img_h_in / 2
+        
+        grid::grid.raster(img,
+          x = unit(page_w_in / 2, "inches"),
+          y = unit(center_y_in, "inches"),
+          width = unit(img_w_in, "inches"),
+          height = unit(img_h_in, "inches"),
+          interpolate = TRUE
+        )
+        
+        cur_y_in - img_h_in - 0.15
+      }
+      
+      # Table 1: Overall matchup matrix — limit width so it doesn't blow up
+      if (!is.null(png_overall) && file.exists(png_overall)) {
+        # Scale width based on number of pitcher columns to avoid oversized table
+        n_pitchers <- if (!is.null(cd$pitchers)) length(cd$pitchers) else 3
+        n_hitters <- if (!is.null(cd$hitters)) length(cd$hitters) else 6
+        # Rough: ~0.8in per column + 1.2in for hitter name column
+        ideal_w <- min(usable_w_in, 1.2 + n_pitchers * 0.85)
+        ideal_w <- max(ideal_w, 3.0)  # minimum 3 inches
+        # Also cap based on row count — if few rows, don't let it get too tall
+        max_h <- min(4.0, 0.4 + n_hitters * 0.35)
+        cur_y_in <- place_gt_png(png_overall, cur_y_in, max_w_in = ideal_w, max_h_in = max_h)
+      }
+      
+      # Table 2: Pitch Group / Platoon / Counts
+      if (!is.null(png_pitch_group) && file.exists(png_pitch_group)) {
+        cur_y_in <- place_gt_png(png_pitch_group, cur_y_in)
+      }
+      
+      # Table 3: Movement Splits
+      if (!is.null(png_movement) && file.exists(png_movement)) {
+        cur_y_in <- place_gt_png(png_movement, cur_y_in)
+      }
+      
+      # Footer
+      grid::grid.text("Data: TrackMan | Coastal Carolina Baseball Analytics", x = 0.5, y = 0.015,
+                     gp = grid::gpar(fontsize = 5, col = "gray50", fontface = "italic"))
+      
+      dev.off()
+      
+      # Clean up temp PNGs
+      for (f in c(png_overall, png_pitch_group, png_movement)) {
+        if (!is.null(f) && file.exists(f)) unlink(f, force = TRUE)
+      }
     }
   )
-  
-  # ============================================================================
-  # END MATCHUP MATRICES TAB
-  # ============================================================================
 
-output$download_scout_pdf <- downloadHandler(
+        # ============================================================================
+  # PITCHER-HITTER MATCHUP TAB - SERVER LOGIC
+  # ============================================================================
+  
+  output$phm_status <- renderText({
+    mode <- input$phm_mode
+    if (mode == "one_hitter") {
+      h <- input$phm_hitter
+      ps <- input$phm_pitchers_multi
+      paste0("Mode: One Hitter vs Pitchers | Hitter: ", ifelse(is.null(h) || h == "", "None", h),
+             " | ", length(ps), " pitcher(s) selected")
+    } else {
+      p <- input$phm_pitcher
+      hs <- input$phm_hitters_multi
+      paste0("Mode: One Pitcher vs Hitters | Pitcher: ", ifelse(is.null(p) || p == "", "None", p),
+             " | ", length(hs), " hitter(s) selected")
+    }
+  })
+  
+  output$phm_results_title <- renderText({
+    mode <- input$phm_mode
+    if (mode == "one_hitter") {
+      paste("Pitcher-Hitter Breakdown:", input$phm_hitter)
+    } else {
+      paste("Pitcher-Hitter Breakdown:", input$phm_pitcher)
+    }
+  })
+  
+  phm_calc_data <- eventReactive(input$phm_analyze, {
+    d <- active_data()
+    mode <- input$phm_mode
+    
+    if (mode == "one_hitter") {
+      h_name <- input$phm_hitter
+      p_names <- input$phm_pitchers_multi
+      if (is.null(h_name) || h_name == "" || length(p_names) == 0) return(NULL)
+      
+      h_data <- d[d$Batter == h_name, , drop = FALSE]
+      if (nrow(h_data) < 20) return(NULL)
+      
+      # Detect batter side
+      batter_side <- detect_batter_handedness(h_name, d)
+      h_splits <- mm_calc_all_splits(h_data, "mean_DRE_bat", is_pitcher = FALSE, batter_side = batter_side)
+      
+      results <- lapply(p_names, function(p_name) {
+        p_data <- d[d$Pitcher == p_name, , drop = FALSE]
+        if (nrow(p_data) < 20) return(NULL)
+        p_hand <- names(sort(table(p_data$PitcherThrows[!is.na(p_data$PitcherThrows)]), decreasing = TRUE))[1]
+        p_splits <- mm_calc_all_splits(p_data, "mean_DRE_pit", is_pitcher = TRUE)
+        detail <- calc_detailed_matchup(h_data, p_data, h_splits, p_splits, p_hand)
+        if (is.null(detail)) return(NULL)
+        detail$pitcher_name <- p_name
+        detail$hitter_name <- h_name
+        detail
+      })
+      results <- Filter(Negate(is.null), results)
+      list(mode = "one_hitter", hitter = h_name, batter_side = batter_side, results = results)
+      
+    } else {
+      p_name <- input$phm_pitcher
+      h_names <- input$phm_hitters_multi
+      if (is.null(p_name) || p_name == "" || length(h_names) == 0) return(NULL)
+      
+      p_data <- d[d$Pitcher == p_name, , drop = FALSE]
+      if (nrow(p_data) < 20) return(NULL)
+      p_hand <- names(sort(table(p_data$PitcherThrows[!is.na(p_data$PitcherThrows)]), decreasing = TRUE))[1]
+      p_splits <- mm_calc_all_splits(p_data, "mean_DRE_pit", is_pitcher = TRUE)
+      
+      results <- lapply(h_names, function(h_name) {
+        h_data <- d[d$Batter == h_name, , drop = FALSE]
+        if (nrow(h_data) < 20) return(NULL)
+        batter_side <- detect_batter_handedness(h_name, d)
+        h_splits <- mm_calc_all_splits(h_data, "mean_DRE_bat", is_pitcher = FALSE, batter_side = batter_side)
+        detail <- calc_detailed_matchup(h_data, p_data, h_splits, p_splits, p_hand)
+        if (is.null(detail)) return(NULL)
+        detail$pitcher_name <- p_name
+        detail$hitter_name <- h_name
+        detail$batter_side <- batter_side
+        detail
+      })
+      results <- Filter(Negate(is.null), results)
+      list(mode = "one_pitcher", pitcher = p_name, pitcher_hand = p_hand, results = results)
+    }
+  })
+  
+  # Arsenal table - shows pitch arsenal with movement profile
+  output$phm_arsenal_table <- render_gt({
+    req(phm_calc_data())
+    cd <- phm_calc_data()
+    if (is.null(cd) || length(cd$results) == 0) return(NULL)
+    
+    if (cd$mode == "one_hitter") {
+      # Show each pitcher's arsenal side by side
+      all_rows <- lapply(cd$results, function(res) {
+        res$arsenal %>% 
+          select(TaggedPitchType, movement_tag, n, pct, avg_velo, avg_ivb, avg_hb) %>%
+          mutate(Pitcher = res$pitcher_name, .before = 1)
+      })
+      df <- bind_rows(all_rows)
+    } else {
+      # One pitcher - show their arsenal once
+      res <- cd$results[[1]]
+      df <- res$arsenal %>%
+        select(TaggedPitchType, movement_tag, n, pct, avg_velo, avg_ivb, avg_hb) %>%
+        mutate(Pitcher = res$pitcher_name, .before = 1)
+    }
+    
+    df %>%
+      mutate(
+        pct = round(pct, 1),
+        avg_velo = round(avg_velo, 1),
+        avg_ivb = round(avg_ivb, 1),
+        avg_hb = round(avg_hb, 1)
+      ) %>%
+      rename(Pitch = TaggedPitchType, Shape = movement_tag, N = n, `Usage%` = pct,
+             Velo = avg_velo, IVB = avg_ivb, HB = avg_hb) %>%
+      gt() %>%
+      tab_header(title = "Pitcher Arsenal Profile",
+                subtitle = "Pitch types with 3%+ usage, classified by movement shape") %>%
+      cols_align(align = "center") %>%
+      tab_options(table.font.size = "13px", column_labels.font.weight = "bold",
+                 column_labels.background.color = "#e8f5f4") %>%
+      tab_style(style = cell_text(weight = "bold"), locations = cells_body(columns = "Pitcher"))
+  })
+  
+  # Breakdown table - shows hitter RV vs each pitch shape
+  output$phm_breakdown_table <- render_gt({
+    req(phm_calc_data())
+    cd <- phm_calc_data()
+    if (is.null(cd) || length(cd$results) == 0) return(NULL)
+    
+    if (cd$mode == "one_hitter") {
+      # One hitter vs multiple pitchers
+      all_rows <- lapply(cd$results, function(res) {
+        breakdown <- res$arsenal %>%
+          select(TaggedPitchType, movement_tag, pct, h_rv, p_rv, h_n, matchup_rv, weighted_contribution, family, h_fam_rv) %>%
+          mutate(Pitcher = res$pitcher_name, .before = 1)
+        
+        # Add summary row
+        summary_row <- tibble(
+          Pitcher = res$pitcher_name,
+          TaggedPitchType = "OVERALL",
+          movement_tag = "",
+          pct = 100,
+          h_rv = res$platoon_rv,
+          p_rv = NA_real_,
+          h_n = NA_integer_,
+          matchup_rv = res$overall_rv,
+          weighted_contribution = res$overall_rv,
+          family = "",
+          h_fam_rv = NA_real_
+        )
+        bind_rows(breakdown, summary_row)
+      })
+      df <- bind_rows(all_rows)
+      
+      df %>%
+        mutate(
+          pct = round(pct, 1),
+          h_rv = round(h_rv, 2),
+          p_rv = round(p_rv, 2),
+          h_fam_rv = round(h_fam_rv, 2),
+          matchup_rv = round(matchup_rv, 2),
+          weighted_contribution = round(weighted_contribution, 2)
+        ) %>%
+        rename(Pitch = TaggedPitchType, Shape = movement_tag, `Usage%` = pct,
+               `H RV/100` = h_rv, `P RV/100` = p_rv, `H N` = h_n,
+               `Family RV` = h_fam_rv,
+               `Matchup RV` = matchup_rv, `Weighted` = weighted_contribution) %>%
+        gt() %>%
+        tab_header(
+          title = paste("Matchup Breakdown:", cd$hitter),
+          subtitle = "How each pitch shape contributes to the overall matchup score"
+        ) %>%
+        data_color(columns = c("Matchup RV"), fn = scales::col_numeric(
+          palette = c("#c0392b", "#f5f5f5", "#1e8449"), domain = c(-8, 0, 8), na.color = "#eee")) %>%
+        data_color(columns = c("H RV/100"), fn = scales::col_numeric(
+          palette = c("#c0392b", "#f5f5f5", "#1e8449"), domain = c(-10, 0, 10), na.color = "#eee")) %>%
+        cols_align(align = "center") %>%
+        sub_missing(missing_text = "-") %>%
+        tab_style(style = list(cell_fill(color = "#e8f5f4"), cell_text(weight = "bold")),
+                 locations = cells_body(rows = Pitch == "OVERALL")) %>%
+        tab_options(table.font.size = "12px", column_labels.font.weight = "bold",
+                   column_labels.background.color = "#e8f5f4") %>%
+        tab_style(style = cell_text(weight = "bold"), locations = cells_body(columns = "Pitcher"))
+    } else {
+      # One pitcher vs multiple hitters
+      all_rows <- lapply(cd$results, function(res) {
+        breakdown <- res$arsenal %>%
+          select(TaggedPitchType, movement_tag, pct, h_rv, p_rv, h_n, matchup_rv, weighted_contribution, family, h_fam_rv) %>%
+          mutate(Hitter = res$hitter_name, .before = 1)
+        
+        summary_row <- tibble(
+          Hitter = res$hitter_name,
+          TaggedPitchType = "OVERALL",
+          movement_tag = "",
+          pct = 100,
+          h_rv = res$platoon_rv,
+          p_rv = NA_real_,
+          h_n = NA_integer_,
+          matchup_rv = res$overall_rv,
+          weighted_contribution = res$overall_rv,
+          family = "",
+          h_fam_rv = NA_real_
+        )
+        bind_rows(breakdown, summary_row)
+      })
+      df <- bind_rows(all_rows)
+      
+      df %>%
+        mutate(
+          pct = round(pct, 1),
+          h_rv = round(h_rv, 2),
+          p_rv = round(p_rv, 2),
+          h_fam_rv = round(h_fam_rv, 2),
+          matchup_rv = round(matchup_rv, 2),
+          weighted_contribution = round(weighted_contribution, 2)
+        ) %>%
+        rename(Pitch = TaggedPitchType, Shape = movement_tag, `Usage%` = pct,
+               `H RV/100` = h_rv, `P RV/100` = p_rv, `H N` = h_n,
+               `Family RV` = h_fam_rv,
+               `Matchup RV` = matchup_rv, `Weighted` = weighted_contribution) %>%
+        gt() %>%
+        tab_header(
+          title = paste("Matchup Breakdown:", cd$pitcher),
+          subtitle = paste0("Pitcher hand: ", cd$pitcher_hand, " | How each hitter performs vs this arsenal")
+        ) %>%
+        data_color(columns = c("Matchup RV"), fn = scales::col_numeric(
+          palette = c("#1e8449", "#f5f5f5", "#c0392b"), domain = c(-8, 0, 8), na.color = "#eee")) %>%
+        data_color(columns = c("H RV/100"), fn = scales::col_numeric(
+          palette = c("#c0392b", "#f5f5f5", "#1e8449"), domain = c(-10, 0, 10), na.color = "#eee")) %>%
+        cols_align(align = "center") %>%
+        sub_missing(missing_text = "-") %>%
+        tab_style(style = list(cell_fill(color = "#e8f5f4"), cell_text(weight = "bold")),
+                 locations = cells_body(rows = Pitch == "OVERALL")) %>%
+        tab_options(table.font.size = "12px", column_labels.font.weight = "bold",
+                   column_labels.background.color = "#e8f5f4") %>%
+        tab_style(style = cell_text(weight = "bold"), locations = cells_body(columns = "Hitter"))
+    }
+  })
+            
+  output$download_scout_pdf <- downloadHandler(
     filename = function() { paste0("scouting_report_", format(Sys.Date(), "%Y%m%d"), ".pdf") },
     content = function(file) {
       data <- scout_data()
       if (length(data) == 0) { showNotification("No hitters selected", type = "warning"); return() }
       
-      # Get custom title if provided
       pdf_title <- if (!is.null(input$pdf_custom_title) && nchar(trimws(input$pdf_custom_title)) > 0) {
         trimws(input$pdf_custom_title)
       } else {
         "HITTER SCOUTING REPORT"
       }
       
-      # Portrait mode - narrow but long (8.5 x 11 inches)
-      pdf(file, width = 8.5, height = 11)
+      pdf(file, width = 8.5, height = 12)  # Portrait tall
       
-      # ============================================================
-      # LAYOUT CONFIGURATION - ALL NUMERIC VALUES HERE
-      # ============================================================
+      MAX_HITTERS_PER_PAGE <- 6
+      n_hitters <- length(data)
+      n_pages <- ceiling(n_hitters / MAX_HITTERS_PER_PAGE)
       
-      # Page layout
-      PAGE_MARGIN_LEFT <- 0.02
-      PAGE_MARGIN_RIGHT <- 0.98
-      PAGE_WIDTH <- PAGE_MARGIN_RIGHT - PAGE_MARGIN_LEFT  # 0.96
-      
-      # Header settings
-      HEADER_Y <- 0.975
-      HEADER_HEIGHT <- 0.045
-      HEADER_FONT_SIZE <- 14
-      HEADER_DATE_FONT_SIZE <- 8
-      
-      # Hitter row configuration
-      MAX_HITTERS_PER_PAGE <- 7
-      HITTER_ROW_HEIGHT <- 0.125
-      
-      # Y positions for hitter rows (top of each row, starting from first hitter)
-      # Row 1 starts at 0.94, each subsequent row is 0.125 lower
-      HITTER_ROW_TOPS <- c(
-        0.940,  # Hitter 1
-        0.815,  # Hitter 2
-        0.690,  # Hitter 3
-        0.565,  # Hitter 4
-        0.440,  # Hitter 5
-        0.315,  # Hitter 6
-        0.190   # Hitter 7
-      )
-      
-      # Within each hitter row - offsets from row top
-      ROW1_OFFSET <- 0.012      # Name/stats row
-      ROW2_OFFSET <- 0.050      # Notes row (expanded)
-      ROW3_OFFSET <- 0.105      # Diamonds row (adjusted for expanded notes)
-      
-      # Row 1 (Name, Hand, Grades, Stats) settings
-      ROW1_HEIGHT <- 0.024
-      ROW1_BG_EVEN <- "#e8f5f4"
-      ROW1_BG_ODD <- "#f0f0f0"
-      
-      # Name and hand positioning
-      NAME_X <- 0.02
-      NAME_FONT_SIZE <- 8
-      HAND_X <- 0.12
-      HAND_FONT_SIZE <- 7
-      
-      # Grade boxes positioning
-      GRADE_START_X <- 0.18
-      GRADE_SPACING <- 0.04
-      GRADE_BOX_WIDTH <- 0.026
-      GRADE_BOX_HEIGHT <- 0.018
-      GRADE_FONT_SIZE <- 5.5
-      # Grade X positions: 0.18, 0.22, 0.26, 0.30, 0.34
-      
-      # Stats pills positioning
-      STAT_START_X <- 0.45
-      STAT_SPACING <- 0.072
-      # Stat X positions: 0.45, 0.522, 0.594, 0.666, 0.738, 0.810
-      
-      # Spray chart pills
-      SPRAY_START_X <- 0.888
-      SPRAY_SPACING <- 0.042
-      SPRAY_PILL_WIDTH <- 0.038
-      # Spray X positions: 0.888, 0.930, 0.972
-      
-      # Row 2 (Notes) settings - Expanded for more notes space
-      ROW2_HEIGHT <- 0.042
-      ROW2_BG <- "white"
-      NOTES_FONT_SIZE <- 5.5
-      LHP_COLOR <- "#C62828"
-      RHP_COLOR <- "black"
-      OVERALL_COLOR <- "#1565C0"
-      MATCHUP_COLOR <- "#6A1B9A"
-      LHP_X <- 0.025
-      RHP_X <- 0.26
-      OVERALL_X <- 0.50
-      MATCHUP_X <- 0.75
-      
-      # Row 3 (Diamonds) settings
-      DIAMOND_SIZE <- 0.014
-      DIAMOND_SPACING <- 0.088
-      DIAMOND_START_X <- 0.06
-      # Diamond X positions: 0.06, 0.148, 0.236, 0.324, 0.412
-      
-      # In-game notes box
-      NOTES_BOX_X <- 0.50
-      NOTES_BOX_WIDTH <- 0.46
-      NOTES_BOX_HEIGHT <- 0.048  # diamond_size * 3.4 ≈ 0.048
-      
-      # Footer
-      FOOTER_Y <- 0.015
-      FOOTER_FONT_SIZE <- 6
-      
-      # Separator line offset from row top
-      SEPARATOR_OFFSET <- 0.117  # hitter_row_height - 0.008
-      
-      # ============================================================
-      # HELPER FUNCTIONS
-      # ============================================================
-      
-      # Helper function to draw a baseball diamond
-      draw_diamond <- function(cx, cy, size) {
+      # ---- HELPER: Draw diamond ----
+      draw_diamond <- function(cx, cy, size, filled = FALSE) {
         x_pts <- c(cx, cx + size, cx, cx - size, cx)
-        y_pts <- c(cy + size, cy, cy - size, cy, cy + size)
+        y_pts <- c(cy + size * 1.0, cy, cy - size * 1.0, cy, cy + size * 1.0)
+        fill_col <- if (filled) "#d4edda" else "white"
         grid::grid.polygon(x = x_pts, y = y_pts, default.units = "npc",
-                          gp = grid::gpar(fill = "#f5f5dc", col = "black", lwd = 0.5))
-        base_size <- size * 0.12
-        grid::grid.rect(x = cx, y = cy - size + base_size, width = base_size * 1.2, height = base_size * 0.8,
-                       default.units = "npc", gp = grid::gpar(fill = "white", col = "black", lwd = 0.3))
-        grid::grid.rect(x = cx + size - base_size, y = cy, width = base_size, height = base_size,
-                       default.units = "npc", gp = grid::gpar(fill = "white", col = "black", lwd = 0.3))
-        grid::grid.rect(x = cx, y = cy + size - base_size, width = base_size, height = base_size,
-                       default.units = "npc", gp = grid::gpar(fill = "white", col = "black", lwd = 0.3))
-        grid::grid.rect(x = cx - size + base_size, y = cy, width = base_size, height = base_size,
-                       default.units = "npc", gp = grid::gpar(fill = "white", col = "black", lwd = 0.3))
+                          gp = grid::gpar(fill = fill_col, col = "gray40", lwd = 0.5))
       }
       
-      # Helper function to get pill color for stats
+      # ---- HELPER: Draw strike zone (3x3 grid) next to diamond ----
+      draw_zone <- function(cx, cy, w, h) {
+        grid::grid.rect(x = cx, y = cy, width = w, height = h, default.units = "npc",
+                       gp = grid::gpar(fill = "white", col = "gray40", lwd = 0.4))
+        third_w <- w / 3; third_h <- h / 3
+        for (i in 1:2) {
+          grid::grid.segments(x0 = cx - w/2 + i * third_w, y0 = cy - h/2,
+                             x1 = cx - w/2 + i * third_w, y1 = cy + h/2,
+                             default.units = "npc", gp = grid::gpar(col = "gray75", lwd = 0.3))
+          grid::grid.segments(x0 = cx - w/2, y0 = cy - h/2 + i * third_h,
+                             x1 = cx + w/2, y1 = cy - h/2 + i * third_h,
+                             default.units = "npc", gp = grid::gpar(col = "gray75", lwd = 0.3))
+        }
+      }
+      
+      # ---- HELPER: Draw one inning column (In/P lines, diamond, zone side by side) ----
+      draw_inning_col <- function(cx, top_y, diamond_size, zone_w, zone_h) {
+        # "In: ___" line
+        grid::grid.text("In:", x = cx - 0.025, y = top_y, just = "left",
+                       gp = grid::gpar(fontsize = 5, col = "gray30"))
+        grid::grid.segments(x0 = cx + 0.0, y0 = top_y - 0.002,
+                           x1 = cx + 0.045, y1 = top_y - 0.002,
+                           default.units = "npc", gp = grid::gpar(col = "gray50", lwd = 0.3))
+        # "P: ___" line
+        grid::grid.text("P:", x = cx - 0.025, y = top_y - 0.012, just = "left",
+                       gp = grid::gpar(fontsize = 5, col = "gray30"))
+        grid::grid.segments(x0 = cx - 0.005, y0 = top_y - 0.014,
+                           x1 = cx + 0.045, y1 = top_y - 0.014,
+                           default.units = "npc", gp = grid::gpar(col = "gray50", lwd = 0.3))
+        # Diamond (left) and Zone (right), side by side
+        pair_y <- top_y - 0.038
+        diamond_cx <- cx - 0.012
+        zone_cx <- cx + 0.022
+        draw_diamond(diamond_cx, pair_y, diamond_size, filled = TRUE)
+        draw_zone(zone_cx, pair_y, zone_w, zone_h)
+      }
+      
+      # ---- HELPER: Stat pill colors ----
       get_stat_pill_color <- function(val, benchmark, higher_better = TRUE, threshold_pct = 10) {
         if (is.na(val) || is.na(benchmark)) return(list(bg = "#E0E0E0", text = "#666666"))
         if (benchmark == 0) {
@@ -3463,414 +5453,208 @@ output$download_scout_pdf <- downloadHandler(
         return(list(bg = "#FFCDD2", text = "#C62828"))
       }
       
-      # Helper function to draw a colored stat pill
-      draw_stat_pill <- function(x, y, label, value, benchmark, higher_better = TRUE, width = 0.055) {
+      draw_stat_pill <- function(x, y, label, value, benchmark, higher_better = TRUE, width = 0.065) {
         colors <- get_stat_pill_color(value, benchmark, higher_better)
-        grid::grid.roundrect(x = x, y = y, width = width, height = 0.014,
-                            r = unit(0.5, "mm"), default.units = "npc",
-                            gp = grid::gpar(fill = colors$bg, col = NA))
+        grid::grid.roundrect(x = x, y = y, width = width, height = 0.012,
+                            r = unit(0.3, "snpc"), default.units = "npc",
+                            gp = grid::gpar(fill = colors$bg, col = "#888"))
         grid::grid.text(label, x = x, y = y, 
-                       gp = grid::gpar(fontsize = 5, fontface = "bold", col = colors$text))
+                       gp = grid::gpar(fontsize = 5, fontface = "bold"))
       }
       
-      # Helper function to get hand label color
-      get_hand_color <- function(hand) {
-        if (hand == "Left") return("#C62828")
-        if (hand == "Switch") return("#1565C0")
-        return("black")
+      # ---- HELPER: Draw RHP/LHP note table ----
+      draw_note_table <- function(x_start, y_top, width, hand_label, hand_color) {
+        col_labels <- c("0-0", "Attack", "FB", "Offspeed", "2k")
+        n_cols <- 5
+        col_w <- width / n_cols
+        banner_h <- 0.012
+        header_h <- 0.010
+        note_h <- 0.042
+        
+        # Banner bar
+        grid::grid.rect(x = x_start + width/2, y = y_top, width = width, height = banner_h,
+                       default.units = "npc",
+                       gp = grid::gpar(fill = hand_color, col = NA))
+        grid::grid.text(hand_label, x = x_start + width/2, y = y_top,
+                       gp = grid::gpar(fontsize = 7, fontface = "bold", col = "white"))
+        
+        # Column headers
+        header_y <- y_top - banner_h/2 - header_h/2
+        for (i in 1:n_cols) {
+          cx <- x_start + (i - 0.5) * col_w
+          grid::grid.rect(x = cx, y = header_y, width = col_w, height = header_h,
+                         default.units = "npc",
+                         gp = grid::gpar(fill = "#f0f0f0", col = "gray60", lwd = 0.3))
+          grid::grid.text(col_labels[i], x = cx, y = header_y,
+                         gp = grid::gpar(fontsize = 5.5, fontface = "bold", col = "gray30"))
+        }
+        
+        # Note cells (empty, to be filled in by hand when printed)
+        note_y <- header_y - header_h/2 - note_h/2
+        for (i in 1:n_cols) {
+          cx <- x_start + (i - 0.5) * col_w
+          grid::grid.rect(x = cx, y = note_y, width = col_w, height = note_h,
+                         default.units = "npc",
+                         gp = grid::gpar(fill = "white", col = "gray60", lwd = 0.3))
+        }
+        
+        note_y - note_h/2
       }
-      
-      # ============================================================
-      # PDF GENERATION
-      # ============================================================
-      
-      n_hitters <- length(data)
-      n_pages <- ceiling(n_hitters / MAX_HITTERS_PER_PAGE)
       
       for (page in 1:n_pages) {
         if (page > 1) grid::grid.newpage()
         
-        # === PAGE HEADER ===
-        grid::grid.rect(x = 0.5, y = HEADER_Y, width = 1, height = HEADER_HEIGHT, 
+        # Page header
+        grid::grid.rect(x = 0.5, y = 0.982, width = 1, height = 0.028,
                        gp = grid::gpar(fill = "#006F71", col = NA))
-        grid::grid.text(pdf_title, x = 0.5, y = HEADER_Y, 
-                       gp = grid::gpar(fontsize = HEADER_FONT_SIZE, fontface = "bold", col = "white"))
-        grid::grid.text(format(Sys.Date(), "%m/%d/%Y"), x = 0.95, y = HEADER_Y, just = "right",
-                       gp = grid::gpar(fontsize = HEADER_DATE_FONT_SIZE, col = "white"))
-        grid::grid.text(paste0("Page ", page, " of ", n_pages), x = 0.05, y = HEADER_Y, just = "left",
-                       gp = grid::gpar(fontsize = HEADER_DATE_FONT_SIZE, col = "white"))
+        grid::grid.text(pdf_title, x = 0.5, y = 0.982,
+                       gp = grid::gpar(fontsize = 12, fontface = "bold", col = "white"))
+        grid::grid.text(format(Sys.Date(), "%m/%d/%Y"), x = 0.95, y = 0.982, just = "right",
+                       gp = grid::gpar(fontsize = 6, col = "white"))
+        grid::grid.text(paste0("Page ", page, " of ", n_pages), x = 0.05, y = 0.982, just = "left",
+                       gp = grid::gpar(fontsize = 6, col = "white"))
         
-        # === GET HITTERS FOR THIS PAGE ===
         start_idx <- (page - 1) * MAX_HITTERS_PER_PAGE + 1
         end_idx <- min(page * MAX_HITTERS_PER_PAGE, n_hitters)
         page_hitters <- names(data)[start_idx:end_idx]
         
-        # === DRAW EACH HITTER ROW ===
+        # Each hitter gets ~0.155 of vertical space (6 per page)
+        hitter_height <- 0.155
+        
         for (h_idx in seq_along(page_hitters)) {
           h_name <- page_hitters[h_idx]
           profile <- data[[h_name]]$profile
-          notes <- data[[h_name]]
           
-          # Get row top Y position from lookup table
-          row_top <- HITTER_ROW_TOPS[h_idx]
+          # Top of this hitter's row
+          row_top <- 0.960 - (h_idx - 1) * hitter_height
           
-          # Calculate Y positions for each row within this hitter's section
-          row1_y <- row_top - ROW1_OFFSET      # e.g., 0.940 - 0.012 = 0.928
-          row2_y <- row_top - ROW2_OFFSET      # e.g., 0.940 - 0.044 = 0.896
-          row3_y <- row_top - ROW3_OFFSET      # e.g., 0.940 - 0.095 = 0.845
-          
-          # === ROW 1: NAME, HAND, GRADES, STATS ===
-          
-          # Background bar
-          row1_bg <- if(h_idx %% 2 == 0) ROW1_BG_EVEN else ROW1_BG_ODD
-          grid::grid.rect(x = 0.5, y = row1_y, width = PAGE_WIDTH, height = ROW1_HEIGHT,
+          # === ROW 1: Header bar with name, grades, stats ===
+          row1_y <- row_top - 0.005
+          row1_bg <- if(h_idx %% 2 == 0) "#e8f5f4" else "#f0f0f0"
+          grid::grid.rect(x = 0.5, y = row1_y, width = 0.97, height = 0.018,
                          gp = grid::gpar(fill = row1_bg, col = NA))
           
-          # Name (first initial + last name format)
+          # Name
           short_name <- format_short_name(h_name)
-          grid::grid.text(short_name, x = NAME_X, y = row1_y, just = "left",
-                         gp = grid::gpar(fontsize = NAME_FONT_SIZE, fontface = "bold"))
+          grid::grid.text(short_name, x = 0.02, y = row1_y, just = "left",
+                         gp = grid::gpar(fontsize = 8, fontface = "bold"))
           
-          # Hand label - abbreviated (R), (L), (B)
+          # Hand
           hand_label <- format_batter_hand(profile$hand)
-          hand_color <- get_hand_color(profile$hand)
-          grid::grid.text(hand_label, x = HAND_X, y = row1_y, just = "left",
-                         gp = grid::gpar(fontsize = HAND_FONT_SIZE, col = hand_color, fontface = "bold"))
+          hand_color <- if (profile$hand == "Left") "#C62828" else if (profile$hand == "Switch") "#1565C0" else "black"
+          grid::grid.text(hand_label, x = 0.10, y = row1_y, just = "left",
+                         gp = grid::gpar(fontsize = 7, col = hand_color, fontface = "bold"))
           
-          # Grade boxes - explicit X positions (Overall, GamePwr, Contact, AvoidK, SwDec)
+          # Grade boxes (compact)
           grades <- c(profile$overall_grade, profile$game_power_grade, profile$contact_grade, 
                      profile$avoid_k_grade, profile$swing_dec_grade)
-          grade_labels <- c("Overall", "GamePwr", "Contact", "AvoidK", "SwDec")
-          grade_x_positions <- c(0.18, 0.22, 0.26, 0.30, 0.34)
+          grade_labels <- c("OVR", "GPwr", "Con", "AvK", "SwD")
+          grade_x <- c(0.155, 0.195, 0.235, 0.275, 0.315)
           
           for (g_idx in 1:5) {
-            # Grade box with number
-            grid::grid.rect(x = grade_x_positions[g_idx], y = row1_y + 0.004, 
-                           width = GRADE_BOX_WIDTH, height = GRADE_BOX_HEIGHT,
-                           gp = grid::gpar(fill = grade_color_light(grades[g_idx]), col = "gray50", lwd = 0.3))
-            grid::grid.text(grades[g_idx], x = grade_x_positions[g_idx], y = row1_y + 0.004, 
-                           gp = grid::gpar(fontsize = GRADE_FONT_SIZE, fontface = "bold"))
-            # Label below the grade box
-            grid::grid.text(grade_labels[g_idx], x = grade_x_positions[g_idx], y = row1_y - 0.008, 
-                           gp = grid::gpar(fontsize = 4, col = "gray40"))
+            grid::grid.roundrect(x = grade_x[g_idx], y = row1_y + 0.002,
+                           width = 0.028, height = 0.014,
+                           r = unit(0.3, "snpc"), default.units = "npc",
+                           gp = grid::gpar(fill = grade_color_light(grades[g_idx]), col = "#888"))
+            grid::grid.text(grades[g_idx], x = grade_x[g_idx], y = row1_y + 0.002,
+                           gp = grid::gpar(fontsize = 5.5, fontface = "bold"))
+            grid::grid.text(grade_labels[g_idx], x = grade_x[g_idx], y = row1_y - 0.007,
+                           gp = grid::gpar(fontsize = 3.5, col = "gray40"))
           }
           
-          # Stats pills - explicit X positions
-          stat_x_positions <- c(0.450, 0.522, 0.594, 0.666, 0.738, 0.810)
+          # Stat pills (right side of header)
+          h_raw_pdf <- active_data() %>% filter(Batter == h_name)
+          fp_swing_pct <- if(sum(h_raw_pdf$Balls == 0 & h_raw_pdf$Strikes == 0, na.rm = TRUE) >= 10) {
+            100 * sum(h_raw_pdf$is_swing[h_raw_pdf$Balls == 0 & h_raw_pdf$Strikes == 0], na.rm = TRUE) /
+              sum(h_raw_pdf$Balls == 0 & h_raw_pdf$Strikes == 0, na.rm = TRUE)
+          } else NA
+          iz_swing_pct <- if(sum(h_raw_pdf$in_zone, na.rm = TRUE) >= 10) {
+            100 * sum(h_raw_pdf$z_swing, na.rm = TRUE) / sum(h_raw_pdf$in_zone, na.rm = TRUE)
+          } else NA
+          twok_chase_pct <- if(sum(h_raw_pdf$Strikes == 2 & h_raw_pdf$out_of_zone == 1, na.rm = TRUE) >= 10) {
+            100 * sum(h_raw_pdf$Strikes == 2 & h_raw_pdf$chase == 1, na.rm = TRUE) /
+              sum(h_raw_pdf$Strikes == 2 & h_raw_pdf$out_of_zone == 1, na.rm = TRUE)
+          } else NA
           
-          # RV/100
+          stat_x <- c(0.375, 0.440, 0.505, 0.565, 0.625, 0.685, 0.745, 0.805, 0.870)
+          pill_w <- 0.058
+          
           rv_val <- if(!is.na(profile$rv100)) sprintf("%+.1f", profile$rv100) else "-"
-          draw_stat_pill(stat_x_positions[1], row1_y, paste0("RV:", rv_val), profile$rv100, 0, TRUE, 0.058)
-          
-          # wOBA
+          draw_stat_pill(stat_x[1], row1_y, paste0("RV:", rv_val), profile$rv100, 0, TRUE, pill_w)
           woba_val <- if(!is.na(profile$woba)) sprintf(".%03d", round(profile$woba * 1000)) else "-"
-          draw_stat_pill(stat_x_positions[2], row1_y, paste0("wOBA:", woba_val), profile$woba, 0.320, TRUE, 0.068)
-          
-          # EV90
+          draw_stat_pill(stat_x[2], row1_y, paste0("wOBA:", woba_val), profile$woba, 0.320, TRUE, 0.062)
           ev90_val <- if(!is.na(profile$ev90)) sprintf("%.0f", profile$ev90) else "-"
-          draw_stat_pill(stat_x_positions[3], row1_y, paste0("EV90:", ev90_val), profile$ev90, 95, TRUE, 0.058)
-          
-          # K%
+          draw_stat_pill(stat_x[3], row1_y, paste0("EV90:", ev90_val), profile$ev90, 95, TRUE, pill_w)
           k_val <- if(!is.na(profile$k_pct)) sprintf("%.0f%%", profile$k_pct) else "-"
-          draw_stat_pill(stat_x_positions[4], row1_y, paste0("K:", k_val), profile$k_pct, 22, FALSE, 0.052)
-          
-          # BB%
-          bb_val <- if(!is.na(profile$bb_pct)) sprintf("%.0f%%", profile$bb_pct) else "-"
-          draw_stat_pill(stat_x_positions[5], row1_y, paste0("BB:", bb_val), profile$bb_pct, 9, TRUE, 0.052)
-          
-          # Whiff%
+          draw_stat_pill(stat_x[4], row1_y, paste0("K:", k_val), profile$k_pct, 22, FALSE, pill_w)
           whiff_val <- if(!is.na(profile$whiff_pct)) sprintf("%.0f%%", profile$whiff_pct) else "-"
-          draw_stat_pill(stat_x_positions[6], row1_y, paste0("Wh:", whiff_val), profile$whiff_pct, 25, FALSE, 0.052)
+          draw_stat_pill(stat_x[5], row1_y, paste0("Wh:", whiff_val), profile$whiff_pct, 25, FALSE, pill_w)
+          fp_val <- if(!is.na(fp_swing_pct)) sprintf("%.0f%%", fp_swing_pct) else "-"
+          draw_stat_pill(stat_x[6], row1_y, paste0("FPS:", fp_val), fp_swing_pct, 30, FALSE, pill_w)
+          iz_val <- if(!is.na(iz_swing_pct)) sprintf("%.0f%%", iz_swing_pct) else "-"
+          draw_stat_pill(stat_x[7], row1_y, paste0("IZS:", iz_val), iz_swing_pct, 68, TRUE, pill_w)
+          twok_val <- if(!is.na(twok_chase_pct)) sprintf("%.0f%%", twok_chase_pct) else "-"
+          draw_stat_pill(stat_x[8], row1_y, paste0("2KC:", twok_val), twok_chase_pct, 33, FALSE, pill_w)
+          bb_val <- if(!is.na(profile$bb_pct)) sprintf("%.0f%%", profile$bb_pct) else "-"
+          draw_stat_pill(stat_x[9], row1_y, paste0("BB:", bb_val), profile$bb_pct, 9, TRUE, pill_w)
           
-          # Spray tendencies - explicit X positions
-          spray_x_positions <- c(0.888, 0.930, 0.972)
+          # === ROW 2: 5 Inning columns (In/P + Diamond + Zone each) + Game Notes box ===
+          inning_top_y <- row1_y - 0.018
+          diamond_size <- 0.012
+          zone_w <- 0.022
+          zone_h <- 0.024
           
-          pull_val <- if(!is.na(profile$pull_pct)) sprintf("%.0f", profile$pull_pct) else "-"
-          draw_stat_pill(spray_x_positions[1], row1_y, paste0("P:", pull_val), profile$pull_pct, 40, TRUE, SPRAY_PILL_WIDTH)
+          # 5 inning columns spread across left ~65%
+          inning_x_positions <- seq(0.06, 0.58, length.out = 5)
           
-          mid_val <- if(!is.na(profile$middle_pct)) sprintf("%.0f", profile$middle_pct) else "-"
-          draw_stat_pill(spray_x_positions[2], row1_y, paste0("M:", mid_val), profile$middle_pct, 38, TRUE, SPRAY_PILL_WIDTH)
-          
-          oppo_val <- if(!is.na(profile$oppo_pct)) sprintf("%.0f", profile$oppo_pct) else "-"
-          draw_stat_pill(spray_x_positions[3], row1_y, paste0("O:", oppo_val), profile$oppo_pct, 22, TRUE, SPRAY_PILL_WIDTH)
-          
-          # === ROW 2: NOTES (Expanded with more space) ===
-          
-          grid::grid.rect(x = 0.5, y = row2_y, width = PAGE_WIDTH, height = ROW2_HEIGHT,
-                         gp = grid::gpar(fill = ROW2_BG, col = "gray80", lwd = 0.3))
-          
-          # Notes layout: LHP Plan | RHP Plan | Overall Notes | Matchup Notes
-          # Each section gets more room for longer notes
-          note_x_positions <- c(LHP_X, RHP_X, OVERALL_X, MATCHUP_X)  # LHP, RHP, Overall, Matchup
-          
-          # Two-line notes for each section
-          row2_y_line1 <- row2_y + 0.008
-          row2_y_line2 <- row2_y - 0.008
-          
-          if (nchar(notes$lhp_plan) > 0) {
-            lhp_text_l1 <- paste0("LHP: ", substr(notes$lhp_plan, 1, 38))
-            lhp_text_l2 <- if(nchar(notes$lhp_plan) > 38) substr(notes$lhp_plan, 39, 75) else ""
-            grid::grid.text(lhp_text_l1, x = note_x_positions[1], y = row2_y_line1, just = "left",
-                           gp = grid::gpar(fontsize = NOTES_FONT_SIZE, col = LHP_COLOR, fontface = "bold"))
-            if (nchar(lhp_text_l2) > 0) {
-              grid::grid.text(lhp_text_l2, x = note_x_positions[1], y = row2_y_line2, just = "left",
-                             gp = grid::gpar(fontsize = NOTES_FONT_SIZE, col = LHP_COLOR))
-            }
+          for (d_idx in 1:5) {
+            draw_inning_col(inning_x_positions[d_idx], inning_top_y, diamond_size, zone_w, zone_h)
           }
           
-          if (nchar(notes$rhp_plan) > 0) {
-            rhp_text_l1 <- paste0("RHP: ", substr(notes$rhp_plan, 1, 38))
-            rhp_text_l2 <- if(nchar(notes$rhp_plan) > 38) substr(notes$rhp_plan, 39, 75) else ""
-            grid::grid.text(rhp_text_l1, x = note_x_positions[2], y = row2_y_line1, just = "left",
-                           gp = grid::gpar(fontsize = NOTES_FONT_SIZE, col = RHP_COLOR, fontface = "bold"))
-            if (nchar(rhp_text_l2) > 0) {
-              grid::grid.text(rhp_text_l2, x = note_x_positions[2], y = row2_y_line2, just = "left",
-                             gp = grid::gpar(fontsize = NOTES_FONT_SIZE, col = RHP_COLOR))
-            }
+          # Game Notes box on right side — extends to right edge
+          notes_box_right <- 0.97
+          notes_box_left <- 0.65
+          notes_box_w <- notes_box_right - notes_box_left
+          notes_box_x <- notes_box_left + notes_box_w / 2
+          notes_box_y <- inning_top_y - 0.025
+          notes_box_h <- 0.058
+          grid::grid.rect(x = notes_box_x, y = notes_box_y, width = notes_box_w, height = notes_box_h,
+                         default.units = "npc",
+                         gp = grid::gpar(fill = "white", col = "gray50", lwd = 0.5))
+          grid::grid.text("In Game Notes:", x = notes_box_left + 0.005, 
+                         y = notes_box_y + notes_box_h/2 - 0.006, just = "left",
+                         gp = grid::gpar(fontsize = 5.5, fontface = "bold", col = "gray40"))
+          for (ln in 1:4) {
+            ln_y <- notes_box_y + notes_box_h/2 - 0.006 - ln * 0.010
+            grid::grid.segments(x0 = notes_box_left + 0.005, y0 = ln_y,
+                               x1 = notes_box_right - 0.005, y1 = ln_y,
+                               default.units = "npc", gp = grid::gpar(col = "gray85", lwd = 0.2))
           }
           
-          if (nchar(notes$overall_notes) > 0) {
-            overall_text_l1 <- paste0("Notes: ", substr(notes$overall_notes, 1, 38))
-            overall_text_l2 <- if(nchar(notes$overall_notes) > 38) substr(notes$overall_notes, 39, 75) else ""
-            grid::grid.text(overall_text_l1, x = note_x_positions[3], y = row2_y_line1, just = "left",
-                           gp = grid::gpar(fontsize = NOTES_FONT_SIZE, col = OVERALL_COLOR, fontface = "bold"))
-            if (nchar(overall_text_l2) > 0) {
-              grid::grid.text(overall_text_l2, x = note_x_positions[3], y = row2_y_line2, just = "left",
-                             gp = grid::gpar(fontsize = NOTES_FONT_SIZE, col = OVERALL_COLOR))
-            }
-          }
+          # === ROW 3: RHP and LHP note tables side by side ===
+          table_top_y <- inning_top_y - 0.060
+          table_width <- 0.47
           
-          # Pitcher matchup notes (for specific pitcher matchup info)
-          if (!is.null(notes$pitcher_matchup_notes) && nchar(notes$pitcher_matchup_notes) > 0) {
-            matchup_text_l1 <- paste0("Matchup: ", substr(notes$pitcher_matchup_notes, 1, 35))
-            matchup_text_l2 <- if(nchar(notes$pitcher_matchup_notes) > 35) substr(notes$pitcher_matchup_notes, 36, 70) else ""
-            grid::grid.text(matchup_text_l1, x = note_x_positions[4], y = row2_y_line1, just = "left",
-                           gp = grid::gpar(fontsize = NOTES_FONT_SIZE, col = MATCHUP_COLOR, fontface = "bold"))
-            if (nchar(matchup_text_l2) > 0) {
-              grid::grid.text(matchup_text_l2, x = note_x_positions[4], y = row2_y_line2, just = "left",
-                             gp = grid::gpar(fontsize = NOTES_FONT_SIZE, col = MATCHUP_COLOR))
-            }
-          }
+          draw_note_table(0.02, table_top_y, table_width, "RHP", "#2962FF")
+          draw_note_table(0.51, table_top_y, table_width, "LHP", "#C62828")
           
-          if (nchar(notes$lhp_plan) == 0 && nchar(notes$rhp_plan) == 0 && nchar(notes$overall_notes) == 0) {
-            grid::grid.text("(add scouting notes)", x = note_x_positions[1], y = row2_y, just = "left",
-                           gp = grid::gpar(fontsize = 5, col = "gray50", fontface = "italic"))
-          }
-          
-          # === ROW 3: DIAMONDS AND IN-GAME NOTES ===
-          
-          # Draw 5 diamonds - explicit X positions
-          diamond_x_positions <- c(0.060, 0.148, 0.236, 0.324, 0.412)
-          
-          for (d in 1:5) {
-            draw_diamond(diamond_x_positions[d], row3_y, DIAMOND_SIZE)
-            grid::grid.text("P:_______", x = diamond_x_positions[d], y = row3_y + DIAMOND_SIZE + 0.010, 
-                           gp = grid::gpar(fontsize = 5, col = "gray40"))
-          }
-          
-          # In-game notes box
-          notes_box_center_x <- NOTES_BOX_X + NOTES_BOX_WIDTH / 2  # 0.50 + 0.23 = 0.73
-          grid::grid.rect(x = notes_box_center_x, y = row3_y, 
-                         width = NOTES_BOX_WIDTH, height = NOTES_BOX_HEIGHT,
-                         gp = grid::gpar(fill = "#fafafa", col = "gray60", lwd = 0.3))
-          grid::grid.text("In-Game Notes:", x = NOTES_BOX_X + 0.01, y = row3_y + NOTES_BOX_HEIGHT/2 - 0.005, just = "left",
-                         gp = grid::gpar(fontsize = 5, col = "gray50", fontface = "italic"))
-          
-          # Dotted lines for writing - explicit Y positions relative to row3_y
-          note_line_y_offsets <- c(0.012, 0.023, 0.034, 0.045)
-          for (line_idx in seq_along(note_line_y_offsets)) {
-            line_y <- row3_y + NOTES_BOX_HEIGHT/2 - note_line_y_offsets[line_idx]
-            grid::grid.lines(x = c(NOTES_BOX_X + 0.01, NOTES_BOX_X + NOTES_BOX_WIDTH - 0.01), 
-                            y = c(line_y, line_y),
-                            gp = grid::gpar(col = "gray80", lwd = 0.3, lty = "dotted"))
-          }
-          
-          # === SEPARATOR LINE ===
+          # Separator line between hitters
+          sep_y <- row_top - hitter_height + 0.003
           if (h_idx < length(page_hitters)) {
-            sep_y <- row_top - SEPARATOR_OFFSET  # e.g., 0.940 - 0.117 = 0.823
-            grid::grid.lines(x = c(PAGE_MARGIN_LEFT, PAGE_MARGIN_RIGHT), y = c(sep_y, sep_y),
-                            gp = grid::gpar(col = "#006F71", lwd = 0.5, lty = "dashed"))
-          }
-        }
-        
-        # === FOOTER ===
-        grid::grid.text("Data: TrackMan | Generated: Coastal Carolina Baseball Analytics", x = 0.5, y = FOOTER_Y,
-                       gp = grid::gpar(fontsize = FOOTER_FONT_SIZE, col = "gray50", fontface = "italic"))
-      }
-      
-      # ============================================================
-      # ADVANCED HEATMAP PAGES - One page per hitter with stat/sample grid
-      # ============================================================
-      
-      # Helper function to draw a mini heatmap cell with stat and sample overlay
-      draw_heatmap_cell <- function(cx, cy, cell_width, cell_height, stat_val, n_sample, 
-                                   stat_type = "whiff", highlight_color = "#FF6666") {
-        # Draw cell background
-        bg_color <- if(is.na(stat_val)) "#f5f5f5" else {
-          # Color based on stat type and value
-          benchmarks <- list(pitch_freq = NA, swing = 48, woba = 0.320, damage = 35, 
-                            chase = 28, whiff = 25, iz_whiff = 15, iz_damage = 35)
-          higher_better <- list(pitch_freq = TRUE, swing = TRUE, woba = TRUE, damage = TRUE, 
-                               chase = FALSE, whiff = FALSE, iz_whiff = FALSE, iz_damage = TRUE)
-          bm <- benchmarks[[stat_type]]
-          hb <- higher_better[[stat_type]]
-          if (is.na(bm)) "#f8f8f8" else {
-            pct_diff <- if(hb) (stat_val - bm) / abs(bm) * 100 else (bm - stat_val) / abs(bm) * 100
-            if (pct_diff > 10) "#C8E6C9" else if (pct_diff > 0) "#DCEDC8" else if (pct_diff >= -10) "#FFF9C4" else "#FFCDD2"
-          }
-        }
-        
-        # Cell background
-        grid::grid.rect(x = cx, y = cy, width = cell_width, height = cell_height,
-                       gp = grid::gpar(fill = bg_color, col = "gray60", lwd = 0.3))
-        
-        # Strike zone mini box
-        zone_size <- min(cell_width, cell_height) * 0.4
-        grid::grid.rect(x = cx, y = cy + cell_height * 0.1, width = zone_size, height = zone_size * 1.1,
-                       gp = grid::gpar(fill = NA, col = "black", lwd = 0.5))
-        
-        # Stat value
-        stat_text <- if(is.na(stat_val)) "-" else {
-          if(stat_type == "pitch_freq") sprintf("%.0f", stat_val)
-          else if(stat_type == "woba") sprintf("%.3f", stat_val)
-          else sprintf("%.1f%%", stat_val)
-        }
-        grid::grid.text(stat_text, x = cx, y = cy + cell_height * 0.1, 
-                       gp = grid::gpar(fontsize = 7, fontface = "bold", col = "#333"))
-        
-        # Sample size
-        grid::grid.text(paste0("n=", n_sample), x = cx, y = cy - cell_height * 0.3,
-                       gp = grid::gpar(fontsize = 5, col = "gray50"))
-      }
-      
-      # Generate advanced heatmap page for each hitter
-      for (h_name in names(data)) {
-        grid::grid.newpage()
-        
-        profile <- data[[h_name]]$profile
-        short_name <- format_short_name(h_name)
-        hand_label <- format_batter_hand(profile$hand)
-        
-        # === PAGE HEADER ===
-        grid::grid.rect(x = 0.5, y = 0.975, width = 1, height = 0.045, 
-                       gp = grid::gpar(fill = "#006F71", col = NA))
-        grid::grid.text(paste0("ADVANCED HEATMAPS: ", short_name, " ", hand_label), 
-                       x = 0.5, y = 0.975, 
-                       gp = grid::gpar(fontsize = 12, fontface = "bold", col = "white"))
-        grid::grid.text(format(Sys.Date(), "%m/%d/%Y"), x = 0.95, y = 0.975, just = "right",
-                       gp = grid::gpar(fontsize = 8, col = "white"))
-        
-        # === PITCH TYPE GRID (TOP HALF) ===
-        grid::grid.text("vs RHP - By Pitch Type", x = 0.5, y = 0.92, 
-                       gp = grid::gpar(fontsize = 10, fontface = "bold", col = "#006F71"))
-        
-        # Column headers
-        stat_cols <- c("Pitch Freq", "Swing%", "wOBA", "Damage", "Chase%", "Whiff%", "IZ Whiff%", "IZ Damage%")
-        stat_types_pdf <- c("pitch_freq", "swing", "woba", "damage", "chase", "whiff", "iz_whiff", "iz_damage")
-        col_width <- 0.1
-        col_start_x <- 0.18
-        
-        for (s_idx in seq_along(stat_cols)) {
-          grid::grid.text(stat_cols[s_idx], x = col_start_x + (s_idx - 0.5) * col_width, y = 0.90,
-                         gp = grid::gpar(fontsize = 6, fontface = "bold", col = "#006F71"))
-        }
-        
-        # Row labels and data for pitch types
-        pitch_rows <- c("4S", "2S/Si", "SL/SW", "CB", "CH/Spl", "Overall")
-        row_height <- 0.065
-        row_start_y <- 0.85
-        
-        # Get stats from cache for RHP
-        pitch_stats_rhp <- get_advanced_heatmap_stats(h_name, "Right", "pitch_type")
-        
-        for (r_idx in seq_along(pitch_rows)) {
-          row_y <- row_start_y - (r_idx - 1) * row_height
-          
-          # Row label
-          grid::grid.text(pitch_rows[r_idx], x = 0.08, y = row_y,
-                         gp = grid::gpar(fontsize = 7, fontface = "bold"))
-          
-          # Get stats for this row
-          row_stat <- NULL
-          for (ps in pitch_stats_rhp) {
-            if (!is.null(ps$pitch_type) && ps$pitch_type == pitch_rows[r_idx]) {
-              row_stat <- ps
-              break
-            }
-          }
-          
-          n_sample <- if(!is.null(row_stat)) row_stat$n else 0
-          
-          # Draw cells for each stat
-          stat_values <- if(!is.null(row_stat)) {
-            c(row_stat$n, row_stat$swing_pct, row_stat$woba, row_stat$damage_pct,
-              row_stat$chase_pct, row_stat$whiff_pct, row_stat$iz_whiff_pct, row_stat$iz_damage_pct)
-          } else rep(NA, 8)
-          
-          for (s_idx in seq_along(stat_types_pdf)) {
-            cell_x <- col_start_x + (s_idx - 0.5) * col_width
-            draw_heatmap_cell(cell_x, row_y, col_width * 0.9, row_height * 0.85, 
-                             stat_values[s_idx], n_sample, stat_types_pdf[s_idx])
-          }
-        }
-        
-        # === COUNT TYPE GRID (BOTTOM HALF) ===
-        grid::grid.text("vs RHP - By Count", x = 0.5, y = 0.42, 
-                       gp = grid::gpar(fontsize = 10, fontface = "bold", col = "#006F71"))
-        
-        # Column headers for count grid
-        for (s_idx in seq_along(stat_cols)) {
-          grid::grid.text(stat_cols[s_idx], x = col_start_x + (s_idx - 0.5) * col_width, y = 0.40,
-                         gp = grid::gpar(fontsize = 6, fontface = "bold", col = "#006F71"))
-        }
-        
-        # Row labels and data for count types
-        count_rows <- c("1P", "2K", "Ahead", "Behind", "Last 15")
-        count_start_y <- 0.35
-        
-        # Get stats from cache for RHP count data
-        count_stats_rhp <- get_advanced_heatmap_stats(h_name, "Right", "count_type")
-        
-        for (r_idx in seq_along(count_rows)) {
-          row_y <- count_start_y - (r_idx - 1) * row_height
-          
-          # Row label
-          grid::grid.text(count_rows[r_idx], x = 0.08, y = row_y,
-                         gp = grid::gpar(fontsize = 7, fontface = "bold"))
-          
-          # Get stats for this row
-          row_stat <- NULL
-          for (cs in count_stats_rhp) {
-            if (!is.null(cs$count_type) && cs$count_type == count_rows[r_idx]) {
-              row_stat <- cs
-              break
-            }
-          }
-          
-          n_sample <- if(!is.null(row_stat)) row_stat$n else 0
-          
-          # Draw cells for each stat
-          stat_values <- if(!is.null(row_stat)) {
-            c(row_stat$n, row_stat$swing_pct, row_stat$woba, row_stat$damage_pct,
-              row_stat$chase_pct, row_stat$whiff_pct, row_stat$iz_whiff_pct, row_stat$iz_damage_pct)
-          } else rep(NA, 8)
-          
-          for (s_idx in seq_along(stat_types_pdf)) {
-            cell_x <- col_start_x + (s_idx - 0.5) * col_width
-            draw_heatmap_cell(cell_x, row_y, col_width * 0.9, row_height * 0.85, 
-                             stat_values[s_idx], n_sample, stat_types_pdf[s_idx])
+            grid::grid.segments(x0 = 0.02, y0 = sep_y, x1 = 0.98, y1 = sep_y,
+                               default.units = "npc", gp = grid::gpar(col = "gray70", lwd = 0.5, lty = 2))
           }
         }
         
         # Footer
-        grid::grid.text("Data: TrackMan | Coastal Carolina Baseball Analytics", x = 0.5, y = 0.02,
-                       gp = grid::gpar(fontsize = 6, col = "gray50", fontface = "italic"))
+        grid::grid.text("Data: TrackMan | Coastal Carolina Baseball Analytics", x = 0.5, y = 0.008,
+                       gp = grid::gpar(fontsize = 5, col = "gray50", fontface = "italic"))
       }
       
       dev.off()
     }
   )
-}
-}
+        
+}  # end server function
 
 shinyApp(ui = ui, server = server)
